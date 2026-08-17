@@ -1,0 +1,302 @@
+local script_path = arg[0]:match("^(.*[/\\])") or "./"
+local Radio = dofile(script_path .. "../mod/scripts/radio.lua")
+
+local object_address = 0
+local function object(fields)
+    fields = fields or {}
+    object_address = (object_address or 0) + 1
+    fields._address = fields._address or object_address
+    fields.valid = true
+    function fields:IsValid() return self.valid end
+    function fields:GetAddress() return self._address end
+    return fields
+end
+
+local world = object()
+local original_sound = object()
+local audio = object({ stopped = false, playing = false, Sound = original_sound })
+function audio:Stop() self.stopped = true self.playing = false end
+function audio:SetSound(sound) self.Sound = sound end
+function audio:SetVolumeMultiplier(volume) self.volume = volume end
+function audio:SetPitchMultiplier(pitch) assert(pitch == 1.0) self.pitch = pitch end
+function audio:SetPaused(paused) assert(paused == false) self.paused = paused end
+function audio:Activate(reset) assert(reset == true) self.active = true end
+function audio:Play(start_time)
+    assert(start_time == 0.0)
+    self.play_count = (self.play_count or 0) + 1
+    self.playing = true
+end
+function audio:IsPlaying() return self.playing end
+
+local tape_player = object({ Audio = audio, VolumeMultiplier = 0.5 })
+function tape_player:GetWorld() return object({ _address = world:GetAddress() }) end
+function tape_player:HasAuthority() return true end
+
+local controller = object({ signals = {} })
+function controller:GetWorld() return object({ _address = world:GetAddress() }) end
+function controller:Server_TapeSetPlaying(target, playing)
+    assert(target == tape_player)
+    table.insert(self.signals, playing)
+end
+
+function FindAllOf(class_name)
+    assert(class_name == "BP_TapePlayer_C")
+    return { tape_player }
+end
+
+local published = {}
+local sync = {}
+function sync:publish_start(url, target_time)
+    local event = {
+        state = "play",
+        url = url,
+        target_time = target_time,
+        serial = "host-1",
+    }
+    table.insert(published, event)
+    return event
+end
+function sync:publish_stop()
+    local event = { state = "stop", serial = "host-2" }
+    table.insert(published, event)
+    return event
+end
+function sync:poll() return nil end
+
+local commands = {}
+local messages = {}
+local url_path = os.tmpname() .. ".url"
+local status_path = os.tmpname() .. ".status"
+local youtube_path = os.tmpname() .. ".m4a"
+local radio = Radio.new({
+    bridge_path = "C:\\Mods\\RVThereNow\\bin\\rv-radio-bridge.exe",
+    status_path = status_path,
+    url_path = url_path,
+    youtube_path = youtube_path,
+    get_player_controller = function() return controller end,
+    get_server_time = function() return 100 end,
+    bridge_available = function() return true end,
+    read_status = function() return nil end,
+    execute = function(command)
+        table.insert(commands, command)
+        return true
+    end,
+    sync = sync,
+    log = function(message) table.insert(messages, message) end,
+})
+
+assert(radio:set_url("https://example.com/live.mp3?token=a&mode=1"))
+assert(radio:source_name() == "example.com")
+assert(radio:set_url("https://www.youtube.com/watch?v=test"))
+local combined_ok, combined_error = radio:set_url("https://example.comhttps://youtu.be/test")
+assert(not combined_ok)
+assert(combined_error == "URL contains another address")
+
+assert(radio:set_url("https://youtu.be/test"))
+assert(radio:start())
+assert(radio.state == "PREPARING")
+assert(radio.backend == "youtube")
+assert(radio.target_time == 112)
+assert(#published == 1 and published[1].url == "https://youtu.be/test")
+assert(audio.stopped)
+assert(#commands == 2)
+assert(commands[1]:find("--stop", 1, true))
+assert(commands[2]:find("--prepare-youtube", 1, true))
+assert(commands[2]:find("--watch Ride-Win64-Shipping.exe", 1, true))
+local url_file = assert(io.open(url_path, "rb"))
+assert(url_file:read("*all") == "https://youtu.be/test")
+url_file:close()
+
+assert(radio:on_tape_state(true))
+assert(radio.play_signal_seen)
+assert(radio:on_tape_state(false))
+assert(radio.state == "OFF")
+assert(radio.detail == "Stopped at RV radio")
+assert(#published == 2 and published[2].state == "stop")
+assert(#commands == 3 and commands[3]:find("--stop", 1, true))
+
+local restart_command_count = #commands
+assert(radio:on_tape_state(true))
+assert(radio.state == "PREPARING")
+assert(radio.play_signal_seen)
+assert(#published == 3 and published[3].state == "play")
+assert(#commands == restart_command_count + 2)
+assert(commands[#commands]:find("--prepare-youtube", 1, true))
+radio:stop()
+
+local failed = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = true,
+    bridge_available = function() return false end,
+    execute = function() return true end,
+})
+assert(not failed:start())
+assert(failed.state == "FAILED")
+assert(failed.detail == "Bundled radio bridge is missing")
+
+local unsynchronized = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = true,
+    bridge_available = function() return true end,
+    execute = function() return true end,
+    get_player_count = function() return 2 end,
+    sync = {
+        publish_start = function()
+            return nil, "Steam lobby metadata unavailable"
+        end,
+    },
+})
+assert(not unsynchronized:start())
+assert(unsynchronized.state == "UNAVAILABLE")
+assert(unsynchronized.detail == "Steam lobby metadata unavailable")
+
+local solo_unsynchronized = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = true,
+    status_path = status_path,
+    url_path = url_path,
+    youtube_path = youtube_path,
+    bridge_available = function() return true end,
+    execute = function() return true end,
+    get_server_time = function() return 100 end,
+    get_player_count = function() return 1 end,
+    sync = {
+        publish_start = function()
+            return nil, "Steam session sync unavailable"
+        end,
+    },
+})
+assert(solo_unsynchronized:start())
+assert(solo_unsynchronized.state == "PREPARING")
+assert(solo_unsynchronized.sync_pending)
+assert(solo_unsynchronized.detail == "Local RV audio; waiting for Steam session")
+
+local media_now = 200
+local media_prefix = os.tmpname() .. "-youtube-stream"
+local media_play_path = os.tmpname() .. ".play"
+local media_confirmed_path = os.tmpname() .. ".playing"
+local media_spatial_path = os.tmpname() .. ".spatial"
+local media_sync = {}
+function media_sync:publish_start(url, target_time)
+    return { state = "play", url = url, target_time = target_time, serial = "media-1" }
+end
+function media_sync:publish_stop() return { state = "stop", serial = "media-2" } end
+function media_sync:poll() return nil end
+local file_radio = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = true,
+    status_path = status_path,
+    url_path = url_path,
+    youtube_path = youtube_path,
+    play_path = media_play_path,
+    confirmed_path = media_confirmed_path,
+    spatial_path = media_spatial_path,
+    bridge_available = function() return true end,
+    execute = function() return true end,
+    get_server_time = function() return media_now end,
+    read_status = function()
+        return string.format("STREAM_PCM %s\t44100\t1\t8", media_prefix)
+    end,
+    sync = media_sync,
+})
+assert(file_radio:set_url("https://youtu.be/media-test"))
+assert(file_radio:start())
+media_now = 212
+file_radio:update()
+file_radio:update()
+assert(file_radio.state == "OPENING")
+assert(file_radio.native_play_started)
+local media_play = assert(io.open(media_play_path, "rb"))
+assert(media_play:read("*all") == "0")
+media_play:close()
+local media_spatial = assert(io.open(media_spatial_path, "rb"))
+assert(media_spatial:read("*all") == "0.5000 0.5000")
+media_spatial:close()
+local media_confirmed = assert(io.open(media_confirmed_path, "wb"))
+media_confirmed:close()
+file_radio:update()
+assert(file_radio.state == "PLAYING")
+file_radio:stop()
+assert(not io.open(media_play_path, "rb"))
+assert(not io.open(media_confirmed_path, "rb"))
+
+local stream_prefix = os.tmpname() .. "-stream"
+local stream_play_path = os.tmpname() .. ".play"
+local stream_confirmed_path = os.tmpname() .. ".playing"
+local stream_spatial_path = os.tmpname() .. ".spatial"
+local function write_chunk(sequence)
+    local path = string.format("%s.%06d.pcm", stream_prefix, sequence)
+    local file = assert(io.open(path, "wb"))
+    file:write("pcm")
+    file:close()
+end
+write_chunk(0)
+write_chunk(1)
+local stream_now = 300
+local stream_sync = {}
+function stream_sync:publish_start(url, target_time)
+    return { state = "play", url = url, target_time = target_time, serial = "stream-1" }
+end
+function stream_sync:publish_stop() return { state = "stop", serial = "stream-2" } end
+function stream_sync:poll() return nil end
+local stream_radio = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = true,
+    status_path = status_path,
+    url_path = url_path,
+    youtube_path = youtube_path,
+    play_path = stream_play_path,
+    confirmed_path = stream_confirmed_path,
+    spatial_path = stream_spatial_path,
+    bridge_available = function() return true end,
+    execute = function(command)
+        table.insert(commands, command)
+        return true
+    end,
+    get_server_time = function() return stream_now end,
+    read_status = function()
+        return string.format("STREAM_PCM %s\t48000\t1\t8", stream_prefix)
+    end,
+    sync = stream_sync,
+})
+assert(stream_radio:set_url("https://example.com/live.mp3"))
+assert(stream_radio:start())
+assert(commands[#commands]:find("--stream-pcm", 1, true))
+stream_now = 305
+stream_radio:update()
+assert(stream_radio.state == "PREPARING")
+assert(stream_radio.detail == "Live stream buffered; starting in 7s")
+stream_now = 312
+stream_radio:update()
+assert(stream_radio.state == "OPENING")
+assert(stream_radio.stream_sequence == 0)
+local first_play_count = audio.play_count
+local stream_play = assert(io.open(stream_play_path, "rb"))
+assert(stream_play:read("*all") == "0")
+stream_play:close()
+local stream_spatial = assert(io.open(stream_spatial_path, "rb"))
+assert(stream_spatial:read("*all") == "0.5000 0.5000")
+stream_spatial:close()
+local stream_confirmed = assert(io.open(stream_confirmed_path, "wb"))
+stream_confirmed:close()
+stream_now = 313
+stream_radio:maintain_audio()
+assert(audio.play_count == first_play_count)
+stream_radio:update()
+assert(stream_radio.state == "PLAYING")
+stream_now = 319.97
+stream_radio:maintain_audio()
+assert(stream_radio.stream_sequence == 0)
+assert(stream_radio.native_play_started)
+stream_radio:stop()
+assert(not io.open(stream_play_path, "rb"))
+assert(not io.open(stream_confirmed_path, "rb"))
+
+os.remove(url_path)
+os.remove(status_path)
+os.remove(youtube_path)
+os.remove(media_spatial_path)
+os.remove(stream_spatial_path)
+os.remove(string.format("%s.%06d.pcm", stream_prefix, 0))
+os.remove(string.format("%s.%06d.pcm", stream_prefix, 1))
+print("Lua radio tests passed.")

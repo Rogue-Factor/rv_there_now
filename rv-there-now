@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly APP_ID="3949040"
+readonly SECTION="/Script/Engine.GameSession"
+readonly DEFAULT_MAX_PLAYERS="8"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  rv-there-now set [PLAYER_COUNT] [--config PATH] [--game-dir PATH]
+  rv-there-now status [--config PATH] [--game-dir PATH]
+  rv-there-now reset [--config PATH] [--game-dir PATH]
+  rv-there-now restore [--config PATH] [--game-dir PATH]
+
+Commands:
+  set       Set the host player cap (default: 8, allowed: 1-24).
+  status    Show the configured cap and Game.ini location.
+  reset     Remove the custom cap and return to the game's default.
+  restore   Restore the one-time backup created by the first change.
+
+Path selection, in order:
+  1. --config PATH
+  2. RV_THERE_YET_CONFIG
+  3. --game-dir PATH (Steam/Proton installs)
+  4. Steam library auto-detection (Linux/Proton)
+EOF
+}
+
+fail() {
+  printf 'rv-there-now: %s\n' "$*" >&2
+  exit 1
+}
+
+trim_trailing_slash() {
+  local value="$1"
+  while [[ "$value" == */ && "$value" != "/" ]]; do
+    value="${value%/}"
+  done
+  printf '%s\n' "$value"
+}
+
+config_from_game_dir() {
+  local game_dir steamapps
+  game_dir="$(trim_trailing_slash "$1")"
+
+  if [[ "$game_dir" != */steamapps/common/Ride ]]; then
+    fail "--game-dir must end in steamapps/common/Ride: $game_dir"
+  fi
+
+  steamapps="${game_dir%/common/Ride}"
+  printf '%s/compatdata/%s/pfx/drive_c/users/steamuser/AppData/Local/Ride/Saved/Config/Windows/Game.ini\n' \
+    "$steamapps" "$APP_ID"
+}
+
+steam_library_paths() {
+  local vdf line
+  local -a vdfs=(
+    "$HOME/.steam/steam/steamapps/libraryfolders.vdf"
+    "$HOME/.local/share/Steam/steamapps/libraryfolders.vdf"
+  )
+
+  for vdf in "${vdfs[@]}"; do
+    [[ -f "$vdf" ]] || continue
+    while IFS= read -r line; do
+      if [[ "$line" =~ \"path\"[[:space:]]+\"([^\"]+)\" ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]//\\\\/\\}"
+      fi
+    done < "$vdf"
+  done
+}
+
+discover_config() {
+  local library candidate
+
+  while IFS= read -r library; do
+    candidate="$library/steamapps/compatdata/$APP_ID/pfx/drive_c/users/steamuser/AppData/Local/Ride/Saved/Config/Windows/Game.ini"
+    if [[ -d "$(dirname "$candidate")" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done < <(steam_library_paths | awk '!seen[$0]++')
+
+  return 1
+}
+
+configured_max_players() {
+  local config="$1"
+  [[ -f "$config" ]] || return 1
+
+  awk -v target="[$SECTION]" '
+    function trim(value) {
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      return value
+    }
+    /^[[:space:]]*\[/ {
+      in_target = (tolower(trim($0)) == tolower(target))
+      next
+    }
+    in_target && /^[[:space:]]*[Mm][Aa][Xx][Pp][Ll][Aa][Yy][Ee][Rr][Ss][[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=[[:space:]]*/, "", value)
+      result = trim(value)
+    }
+    END {
+      if (result != "") print result
+      else exit 1
+    }
+  ' "$config"
+}
+
+rewrite_max_players() {
+  local config="$1"
+  local value="${2-}"
+  local mode="$3"
+  local directory temporary
+
+  directory="$(dirname "$config")"
+  mkdir -p "$directory"
+  temporary="$(mktemp "$directory/.Game.ini.rv-there-now.XXXXXX")"
+  trap 'rm -f "$temporary"' RETURN
+
+  if [[ -f "$config" && ! -e "$config.rv-there-now.bak" ]]; then
+    cp -p "$config" "$config.rv-there-now.bak" 2>/dev/null || true
+  fi
+
+  awk -v target="[$SECTION]" -v value="$value" -v mode="$mode" '
+    function trim(text) {
+      sub(/^[[:space:]]+/, "", text)
+      sub(/[[:space:]]+$/, "", text)
+      return text
+    }
+    function finish_section() {
+      if (in_target && mode == "set" && !key_written) {
+        print "MaxPlayers=" value
+        key_written = 1
+      }
+    }
+    /^[[:space:]]*\[/ {
+      finish_section()
+      in_target = (tolower(trim($0)) == tolower(target))
+      if (in_target) {
+        section_seen = 1
+        key_written = 0
+      }
+      print
+      next
+    }
+    in_target && /^[[:space:]]*[Mm][Aa][Xx][Pp][Ll][Aa][Yy][Ee][Rr][Ss][[:space:]]*=/ {
+      if (mode == "set" && !key_written) {
+        print "MaxPlayers=" value
+        key_written = 1
+      }
+      next
+    }
+    { print }
+    END {
+      finish_section()
+      if (mode == "set" && !section_seen) {
+        if (NR > 0) print ""
+        print target
+        print "MaxPlayers=" value
+      }
+    }
+  ' "$config" 2>/dev/null > "$temporary" || {
+    [[ ! -f "$config" ]] || return 1
+    printf '[%s]\nMaxPlayers=%s\n' "$SECTION" "$value" > "$temporary"
+  }
+
+  chmod --reference="$config" "$temporary" 2>/dev/null || chmod 0644 "$temporary"
+  mv -f "$temporary" "$config"
+  trap - RETURN
+}
+
+assert_game_stopped() {
+  if pgrep -f '[R]ide-Win64-Shipping.exe' >/dev/null 2>&1; then
+    fail "RV There Yet? is running; close it before changing Game.ini"
+  fi
+}
+
+command_name="${1-}"
+[[ -n "$command_name" ]] || {
+  usage
+  exit 2
+}
+shift
+
+config_path="${RV_THERE_YET_CONFIG-}"
+game_dir=""
+player_count=""
+
+while (($#)); do
+  case "$1" in
+    --config)
+      (($# >= 2)) || fail "--config requires a path"
+      config_path="$2"
+      shift 2
+      ;;
+    --game-dir)
+      (($# >= 2)) || fail "--game-dir requires a path"
+      game_dir="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --*)
+      fail "unknown option: $1"
+      ;;
+    *)
+      [[ "$command_name" == "set" && -z "$player_count" ]] || fail "unexpected argument: $1"
+      player_count="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$config_path" && -n "$game_dir" ]]; then
+  fail "use only one of --config and --game-dir"
+fi
+
+if [[ -z "$config_path" && -n "$game_dir" ]]; then
+  config_path="$(config_from_game_dir "$game_dir")"
+fi
+
+if [[ -z "$config_path" ]]; then
+  config_path="$(discover_config)" || fail "could not find the RV There Yet? Proton prefix; use --game-dir or --config"
+fi
+
+case "$command_name" in
+  set)
+    player_count="${player_count:-$DEFAULT_MAX_PLAYERS}"
+    [[ "$player_count" =~ ^[0-9]+$ ]] || fail "player count must be an integer"
+    ((player_count >= 1 && player_count <= 24)) || fail "player count must be between 1 and 24"
+    assert_game_stopped
+    rewrite_max_players "$config_path" "$player_count" set
+    printf 'Player cap set to %d\nGame.ini: %s\n' "$player_count" "$config_path"
+    if ((player_count > 8)); then
+      printf 'Warning: counts above 8 may be unstable.\n' >&2
+    fi
+    ;;
+  status)
+    if player_count="$(configured_max_players "$config_path")"; then
+      printf 'Player cap: %s\nGame.ini: %s\n' "$player_count" "$config_path"
+    else
+      printf 'Player cap: game default (4)\nGame.ini: %s\n' "$config_path"
+    fi
+    ;;
+  reset)
+    assert_game_stopped
+    if [[ -f "$config_path" ]]; then
+      rewrite_max_players "$config_path" "" reset
+    fi
+    printf 'Player cap reset to game default (4)\nGame.ini: %s\n' "$config_path"
+    ;;
+  restore)
+    assert_game_stopped
+    [[ -f "$config_path.rv-there-now.bak" ]] || fail "no backup exists: $config_path.rv-there-now.bak"
+    cp -p "$config_path.rv-there-now.bak" "$config_path"
+    printf 'Restored backup\nGame.ini: %s\n' "$config_path"
+    ;;
+  *)
+    usage >&2
+    fail "unknown command: $command_name"
+    ;;
+esac
