@@ -29,7 +29,7 @@ Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` 
 
 ## Credits
 
-Thanks to **squ1rt5** for the internet radio idea.
+Thanks to **squ1rt5** for the multiplayer idea and **GregTheMeg** for the internet radio idea.
 
 ## Install with a mod manager
 
