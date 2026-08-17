@@ -145,5 +145,6 @@ grep -Fq 'JSON.parse' "$ROOT/mod/bin/accuradio-resolver.js" \
 [[ -f "$ROOT/mod/licenses/THIRD_PARTY_LICENSES.yt-dlp.txt" ]] \
     || fail 'yt-dlp third-party licenses are missing'
 [[ -f "$ROOT/mod/licenses/LICENSE.quickjs-ng" ]] || fail 'QuickJS license is missing'
+[[ -f "$ROOT/LICENSE" ]] || fail 'project GPL license is missing'
 
 printf 'All tests passed.\n'

@@ -31,6 +31,14 @@ Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` 
 
 Thanks to **squ1rt5** for the multiplayer idea and **GregTheMeg** for the internet radio idea.
 
+## License
+
+Copyright (C) 2026 Rogue-Factor.
+
+Unless otherwise noted, the original source code and assets in this repository are licensed under the [GNU General Public License version 3 or later](LICENSE).
+
+Bundled third-party components are not relicensed. They remain available under their respective terms in `mod/licenses` and `bridge/vendor`.
+
 ## Install with a mod manager
 
 Install the package through Thunderstore Mod Manager or r2modman. The required `Thunderstore-unreal_shimloader` dependency is declared in `manifest.json` and should be installed automatically.

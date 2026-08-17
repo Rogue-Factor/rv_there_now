@@ -15,7 +15,7 @@ readonly OUTPUT="$OUTPUT_DIR/Rogue-Factor-RVThereNow-$VERSION.zip"
 mkdir -p "$OUTPUT_DIR"
 (
   cd "$ROOT"
-  zip -qrFS "$OUTPUT" manifest.json README.md CHANGELOG.md icon.png mod
+  zip -qrFS "$OUTPUT" manifest.json README.md CHANGELOG.md LICENSE icon.png mod
 )
 
 printf '%s\n' "$OUTPUT"
