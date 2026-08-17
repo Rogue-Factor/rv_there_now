@@ -27,6 +27,10 @@ The bridge watches the game process and exits automatically when the game closes
 
 Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` class default. Create a new lobby after applying it. The first change also creates a one-time backup beside `Game.ini`.
 
+## Credits
+
+Thanks to **squ1rt5** for the internet radio idea.
+
 ## Install with a mod manager
 
 Install the package through Thunderstore Mod Manager or r2modman. The required `Thunderstore-unreal_shimloader` dependency is declared in `manifest.json` and should be installed automatically.
