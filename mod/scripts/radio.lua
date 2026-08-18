@@ -7,6 +7,7 @@ local SYNC_LEAD_SECONDS = 12
 local module_source = debug.getinfo(1, "S").source:gsub("^@", "")
 local module_directory = module_source:match("^(.*[\\/])") or ""
 local DEFAULT_BRIDGE_PATH = module_directory .. "..\\bin\\rv-radio-bridge.exe"
+local DEFAULT_LAUNCHER_PATH = module_directory .. "..\\bin\\rv-radio-launcher.dll"
 
 local function default_is_valid(object)
     if not object then
@@ -66,6 +67,7 @@ function Radio.new(options)
     local self = {
         url = options.url or DEFAULT_URL,
         bridge_path = options.bridge_path or DEFAULT_BRIDGE_PATH,
+        launcher_path = options.launcher_path or DEFAULT_LAUNCHER_PATH,
         status_path = options.status_path or default_status_path(),
         url_path = options.url_path,
         youtube_path = options.youtube_path,
@@ -73,9 +75,13 @@ function Radio.new(options)
         play_path = options.play_path,
         confirmed_path = options.confirmed_path,
         spatial_path = options.spatial_path,
+        stop_path = options.stop_path,
+        launch_path = options.launch_path,
         is_valid = options.is_valid or default_is_valid,
         log = options.log or function() end,
-        execute = options.execute or os.execute,
+        load_launcher = options.load_launcher or function(path)
+            return package.loadlib(path, "rvtn_launch")
+        end,
         get_player_controller = options.get_player_controller,
         get_server_time = options.get_server_time or function() return os.time() end,
         get_player_count = options.get_player_count or function() return 1 end,
@@ -91,8 +97,6 @@ function Radio.new(options)
         active_serial = nil,
         pcm_sample_rate = nil,
         pcm_channels = nil,
-        play_signal_seen = false,
-        host_signal_sent = false,
         sync_pending = false,
         next_sync_retry_at = nil,
         tape_player = nil,
@@ -101,6 +105,10 @@ function Radio.new(options)
         stream_sequence = 0,
         stream_chunk_seconds = nil,
         native_play_started = false,
+        volume = math.max(0, math.min(1, tonumber(options.volume) or 0.5)),
+        spatial_update_tick = 0,
+        last_left_gain = nil,
+        last_right_gain = nil,
     }
 
     if not self.url_path then
@@ -131,9 +139,21 @@ function Radio.new(options)
             "rv%-there%-now%-radio%.status$", "rv-there-now-radio.playing"
         )
     end
+    if not self.stop_path then
+        local derived, replacements = self.status_path:gsub(
+            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.stop"
+        )
+        self.stop_path = replacements > 0 and derived or (self.status_path .. ".stop")
+    end
+    if not self.launch_path then
+        local derived, replacements = self.status_path:gsub(
+            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.launch"
+        )
+        self.launch_path = replacements > 0 and derived or (self.status_path .. ".launch")
+    end
     if not self.bridge_available then
         self.bridge_available = function()
-            return file_exists(self.bridge_path)
+            return file_exists(self.bridge_path) and file_exists(self.launcher_path)
         end
     end
     if not self.read_status then
@@ -186,13 +206,10 @@ function Radio.new(options)
         return true
     end
 
-    local function execute(command)
-        local ok, result = pcall(self.execute, command)
-        return ok and (result == true or result == 0)
-    end
+    local write_atomic
 
     local function stop_helper()
-        execute(string.format('start "" /wait /B "%s" --stop', self.bridge_path))
+        write_atomic(self.stop_path, "stop")
     end
 
     local function start_helper()
@@ -214,12 +231,18 @@ function Radio.new(options)
         os.remove(self.play_path)
         os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
-        local mode = is_youtube_url(self.url) and "--prepare-youtube" or "--stream-pcm"
-        local command = string.format(
-            'start "" /B "%s" %s --watch Ride-Win64-Shipping.exe',
-            self.bridge_path, mode
-        )
-        if not execute(command) then
+        local mode = is_youtube_url(self.url) and "youtube" or "stream"
+        if not write_atomic(self.launch_path, mode) then
+            return false, "Could not prepare hidden radio launcher"
+        end
+        local loaded, launcher = pcall(self.load_launcher, self.launcher_path)
+        if not loaded or type(launcher) ~= "function" then
+            os.remove(self.launch_path)
+            return false, "Bundled hidden radio launcher is unavailable"
+        end
+        local launched = pcall(launcher)
+        if not launched then
+            os.remove(self.launch_path)
             return false, "Could not launch bundled radio helper"
         end
         self.backend = is_youtube_url(self.url) and "youtube" or "stream"
@@ -234,7 +257,7 @@ function Radio.new(options)
         return ok and tonumber(value) or os.time()
     end
 
-    local function write_atomic(path, content)
+    write_atomic = function(path, content)
         local partial = path .. ".part"
         local file = io.open(partial, "wb")
         if not file then return false end
@@ -252,13 +275,11 @@ function Radio.new(options)
         return true
     end
 
-    local function update_native_spatial()
+    local function update_native_spatial(force)
         if not self.native_play_started then return end
-        local volume = 0.5
-        pcall(function()
-            volume = math.max(0, math.min(1,
-                tonumber(self.tape_player.VolumeMultiplier) or 0.5))
-        end)
+        self.spatial_update_tick = self.spatial_update_tick + 1
+        if not force and self.spatial_update_tick % 4 ~= 0 then return end
+        local volume = self.volume
         local left, right = volume, volume
         pcall(function()
             local controller = self.get_player_controller and self.get_player_controller() or nil
@@ -281,12 +302,19 @@ function Radio.new(options)
             left = volume * distance_gain * (pan > 0 and (1 - pan) or 1)
             right = volume * distance_gain * (pan < 0 and (1 + pan) or 1)
         end)
-        write_atomic(self.spatial_path, string.format("%.4f %.4f", left, right))
+        if force or not self.last_left_gain
+            or math.abs(left - self.last_left_gain) >= 0.002
+            or math.abs(right - self.last_right_gain) >= 0.002 then
+            if write_atomic(self.spatial_path, string.format("%.4f %.4f", left, right)) then
+                self.last_left_gain = left
+                self.last_right_gain = right
+            end
+        end
     end
 
     local function start_native_playback(sequence)
         self.native_play_started = true
-        update_native_spatial()
+        update_native_spatial(true)
         if not write_atomic(self.play_path, tostring(sequence or 0)) then
             self.native_play_started = false
             return false, "Could not signal native audio playback"
@@ -342,13 +370,14 @@ function Radio.new(options)
         self.stream_sequence = 0
         self.stream_chunk_seconds = nil
         self.native_play_started = false
+        self.spatial_update_tick = 0
+        self.last_left_gain = nil
+        self.last_right_gain = nil
         os.remove(self.play_path)
         os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
         os.remove(self.play_path .. ".part")
         os.remove(self.spatial_path .. ".part")
-        self.play_signal_seen = false
-        self.host_signal_sent = false
         self.sync_pending = false
         self.next_sync_retry_at = nil
         self.closing = false
@@ -370,6 +399,9 @@ function Radio.new(options)
             return false, tape_error
         end
         self.active_serial = event.serial
+        if event.volume ~= nil then
+            self.volume = math.max(0, math.min(1, tonumber(event.volume) or self.volume))
+        end
         self.target_time = tonumber(event.target_time) or (server_time() + 5)
         local started, helper_error = start_helper()
         if not started then
@@ -380,22 +412,6 @@ function Radio.new(options)
         stop_unreal_audio()
         self.log("Synchronized RV radio source received")
         return true
-    end
-
-    local function signal_tape(playing)
-        local controller = self.get_player_controller and self.get_player_controller() or nil
-        if not self.is_valid(controller) or not self.is_valid(self.tape_player) then
-            return false
-        end
-        local ok = pcall(function()
-            controller:Server_TapeSetPlaying(self.tape_player, playing)
-        end)
-        if not ok then
-            ok = pcall(function()
-                self.tape_player:SetPlaying(playing)
-            end)
-        end
-        return ok
     end
 
     function self:set_url(url)
@@ -438,7 +454,7 @@ function Radio.new(options)
         local event = nil
         local sync_pending = false
         if self.sync then
-            event, err = self.sync:publish_start(self.url, target)
+            event, err = self.sync:publish_start(self.url, target, self.volume)
             if not event then
                 local count_ok, player_count = pcall(self.get_player_count)
                 if not count_ok or (tonumber(player_count) or 1) > 1 then
@@ -456,6 +472,7 @@ function Radio.new(options)
                 url = self.url,
                 target_time = target,
                 serial = string.format("local-%d", os.time()),
+                volume = self.volume,
             }
         end
         local applied, apply_error = apply_play_event(event)
@@ -473,7 +490,6 @@ function Radio.new(options)
             local _, err = self.sync:publish_stop()
             if err then self.log("Could not publish radio stop: " .. tostring(err)) end
         end
-        signal_tape(false)
         close_local(reason)
         self.log(reason or "Internet radio stopped")
     end
@@ -498,59 +514,40 @@ function Radio.new(options)
             if self:is_active() then close_local("Stopped by host") end
             return
         end
+        if event.state == "volume" then
+            self:set_volume(event.volume, false)
+            return
+        end
         local ok, err = apply_play_event(event)
         if not ok then
             self.log("Could not apply synchronized radio state: " .. tostring(err))
         end
     end
 
-    function self:on_tape_state(playing)
-        if self.closing then
-            return false
+    function self:set_volume(volume, publish)
+        volume = math.max(0, math.min(1, tonumber(volume) or self.volume))
+        self.volume = math.floor(volume * 10 + 0.5) / 10
+        update_native_spatial(true)
+        if publish ~= false and local_is_host() and self.sync then
+            local _, err = self.sync:publish_volume(self.volume)
+            if err then self.log("Could not synchronize radio volume: " .. tostring(err)) end
         end
-        if not self:is_active() then
-            if not playing then return false end
-            local started, err = self:start()
-            if started then
-                self.play_signal_seen = true
-                self.log("Internet radio started from the RV play control")
-                return true
-            end
-            self.log("Could not start internet radio from the RV: " .. tostring(err or self.detail))
-            return false
-        end
-        if playing then
-            self.play_signal_seen = true
-            stop_unreal_audio()
-            return true
-        end
-        if self.play_signal_seen then
-            if local_is_host() and self.sync then self.sync:publish_stop() end
-            close_local("Stopped at RV radio")
-            return true
-        end
-        return false
+        return self.volume
+    end
+
+    function self:adjust_volume(delta)
+        return self:set_volume(self.volume + delta)
     end
 
     function self:update_volume()
-        if not self:is_active() or not self.is_valid(self.tape_player) then return end
-        if self.is_valid(self.tape_player.Audio) then
-            pcall(function()
-                self.tape_player.Audio:SetVolumeMultiplier(
-                    math.max(0, math.min(1,
-                        tonumber(self.tape_player.VolumeMultiplier) or 0.5))
-                )
-            end)
-        end
-        update_native_spatial()
+        update_native_spatial(true)
     end
 
     function self:maintain_audio()
         if not self:is_active() then
             return
         end
-        stop_unreal_audio()
-        self:update_volume()
+        update_native_spatial(false)
     end
 
     function self:update()
@@ -562,7 +559,9 @@ function Radio.new(options)
         if self.sync_pending and local_is_host() and self.sync
             and os.time() >= (self.next_sync_retry_at or 0) then
             self.next_sync_retry_at = os.time() + 5
-            local event = self.sync:publish_start(self.url, self.target_time or server_time())
+            local event = self.sync:publish_start(
+                self.url, self.target_time or server_time(), self.volume
+            )
             if event then
                 self.active_serial = event.serial
                 self.sync_pending = false
@@ -608,10 +607,6 @@ function Radio.new(options)
             if self.stream_prefix then
                 self.detail = string.format("Live stream buffered; starting in %ds", remaining)
             end
-        end
-        if local_is_host() and not self.host_signal_sent and self.target_time and now >= self.target_time then
-            self.host_signal_sent = true
-            signal_tape(true)
         end
         if self.stream_prefix and not self.native_play_started
             and self.target_time and now >= self.target_time then

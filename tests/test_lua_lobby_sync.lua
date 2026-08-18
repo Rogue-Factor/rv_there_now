@@ -29,13 +29,25 @@ local client = LobbySync.new({
     matchmaking = matchmaking,
 })
 
-local published = assert(host:publish_start("https://youtu.be/test", 42.5))
+local published = assert(host:publish_start("https://youtu.be/test", 42.5, 0.7))
 assert(published.state == "play")
 assert(writes[#writes] == "rvtn_radio_serial")
 local received = assert(client:poll())
 assert(received.url == "https://youtu.be/test")
 assert(received.target_time == 42.5)
+assert(received.volume == 0.7)
 assert(client:poll() == nil)
+
+assert(host:publish_volume(0.4))
+local volume = assert(client:poll())
+assert(volume.state == "volume" and volume.volume == 0.4)
+local late_client = LobbySync.new({
+    context = function() return {} end,
+    sessions = sessions,
+    matchmaking = matchmaking,
+})
+local late_play = assert(late_client:poll())
+assert(late_play.state == "play" and late_play.volume == 0.4)
 
 assert(host:publish_stop())
 assert(writes[#writes] == "rvtn_radio_serial")
@@ -77,10 +89,22 @@ local presence_client = LobbySync.new({
     host_id = host_id,
 })
 local long_url = "https://example.com/" .. string.rep("radio-segment/", 25)
-assert(presence_host:publish_start(long_url, 91.25))
+assert(presence_host:publish_start(long_url, 91.25, 0.8))
 local presence_event = assert(presence_client:poll())
 assert(presence_event.url == long_url)
 assert(presence_event.target_time == 91.25)
+assert(presence_event.volume == 0.8)
+assert(presence_host:publish_volume(0.3))
+assert(presence_client:poll().volume == 0.3)
+local late_presence_client = LobbySync.new({
+    context = function() return {} end,
+    sessions = no_lobbies,
+    matchmaking = unavailable_matchmaking,
+    friends = friends,
+    host_id = host_id,
+})
+assert(late_presence_client:poll().state == "play")
+assert(late_presence_client:poll().volume == 0.3)
 assert(presence_host:publish_stop())
 assert(presence_client:poll().state == "stop")
 

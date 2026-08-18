@@ -51,6 +51,7 @@ static wchar_t g_status_path[MAX_PATH];
 static wchar_t g_url_path[MAX_PATH];
 static wchar_t g_play_path[MAX_PATH];
 static wchar_t g_confirm_path[MAX_PATH];
+static wchar_t g_stop_path[MAX_PATH];
 
 static void initialize_temp_paths(void)
 {
@@ -61,6 +62,7 @@ static void initialize_temp_paths(void)
         wcscpy(g_url_path, L"rv-there-now-radio.url");
         wcscpy(g_play_path, L"rv-there-now-radio.play");
         wcscpy(g_confirm_path, L"rv-there-now-radio.playing");
+        wcscpy(g_stop_path, L"rv-there-now-radio.stop");
         return;
     }
     _snwprintf(g_status_path, MAX_PATH - 1, L"%lsrv-there-now-radio.status", temp_path);
@@ -72,6 +74,9 @@ static void initialize_temp_paths(void)
     _snwprintf(g_confirm_path, MAX_PATH - 1,
         L"%lsrv-there-now-radio.playing", temp_path);
     g_confirm_path[MAX_PATH - 1] = L'\0';
+    _snwprintf(g_stop_path, MAX_PATH - 1,
+        L"%lsrv-there-now-radio.stop", temp_path);
+    g_stop_path[MAX_PATH - 1] = L'\0';
 }
 
 static int read_url_file(wchar_t* url, size_t capacity)
@@ -483,6 +488,36 @@ static int signal_existing_bridge(void)
     return 1;
 }
 
+static DWORD WINAPI monitor_stop_file(void* parameter)
+{
+    HANDLE event = (HANDLE)parameter;
+    while (WaitForSingleObject(event, 25) == WAIT_TIMEOUT) {
+        if (GetFileAttributesW(g_stop_path) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(g_stop_path);
+            SetEvent(event);
+            break;
+        }
+    }
+    CloseHandle(event);
+    return 0;
+}
+
+static void start_stop_file_monitor(HANDLE event)
+{
+    HANDLE duplicate = NULL;
+    HANDLE thread;
+    if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &duplicate,
+            0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        return;
+    }
+    thread = CreateThread(NULL, 0, monitor_stop_file, duplicate, 0, NULL);
+    if (thread == NULL) {
+        CloseHandle(duplicate);
+        return;
+    }
+    CloseHandle(thread);
+}
+
 static HANDLE create_stop_event(void)
 {
     HANDLE event;
@@ -490,6 +525,8 @@ static HANDLE create_stop_event(void)
     for (attempt = 0; attempt < 30; ++attempt) {
         event = CreateEventW(NULL, TRUE, FALSE, STOP_EVENT_NAME);
         if (event != NULL && GetLastError() != ERROR_ALREADY_EXISTS) {
+            DeleteFileW(g_stop_path);
+            start_stop_file_monitor(event);
             return event;
         }
         if (event != NULL) {

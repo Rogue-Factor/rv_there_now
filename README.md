@@ -21,9 +21,9 @@ SomaFM MP3 stations are decoded continuously into eight-second mono PCM chunks. 
 
 AccuRadio is resolved through its playlist endpoint. The bundled QuickJS runtime parses the playlist, and the bridge downloads and decodes its M4A tracks into the same continuous PCM queue. YouTube sources are downloaded and decoded locally through the bundled tools, then staged into that queue. No machine-installed media tools or runtimes are required.
 
-The host publishes the source and a shared start time through Steam lobby metadata, with Steam rich presence as a fallback for sessions that do not expose their lobby. Every modded player resolves the source locally. Lua continuously sends the bridge per-client distance, stereo pan, and cassette volume gains computed from the RV and listener positions. Physical Play and Stop state comes from the replicated tape player, and the tape changer selects the previous or next internet station. Every player who should hear internet radio must install the mod.
+The host publishes the source, shared start time, and radio volume through Steam lobby metadata, with Steam rich presence as a fallback for sessions that do not expose their lobby. Every modded player resolves the source locally. Lua sends the bridge per-client distance and stereo pan computed from the RV and listener positions. The RV radio's physical Play, Stop, volume, previous, and next buttons control internet radio directly; vanilla cassettes are hidden and their finite tape index is never changed. Previous and next wrap around the station catalog. Every player who should hear internet radio must install the mod.
 
-The bridge watches the game process and exits automatically when the game closes.
+The bridge launches its audio worker without a console window, watches the game process, and exits automatically when the game closes.
 
 Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` class default. Create a new lobby after applying it. The first change also creates a one-time backup beside `Game.ini`.
 

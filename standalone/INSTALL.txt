@@ -17,6 +17,7 @@ Install
    Ride\Binaries\Win64\dwmapi.dll
    Ride\Binaries\Win64\UE4SS.dll
    Ride\Binaries\Win64\Mods\RVThereNow\Scripts\main.lua
+   Ride\Binaries\Win64\Mods\RVThereNow\bin\rv-radio-launcher.dll
 
 5. Start the game normally. Press F6 to open the dashboard.
 

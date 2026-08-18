@@ -121,14 +121,26 @@ if grep -Fq 'SIK_QueueAudio' "$ROOT/mod/scripts/radio.lua"; then
 fi
 grep -Fq 'same_unreal_object(' "$ROOT/mod/scripts/radio.lua" \
     || fail 'UE4SS UObject wrappers must be compared by Unreal address'
-grep -Fq '"Interact",' "$ROOT/mod/scripts/main.lua" \
+grep -Fq 'class_path .. "Interact"' "$ROOT/mod/scripts/main.lua" \
     || fail 'physical tape changer interaction hook is missing'
-grep -Fq 'tape_player.NextTapeButton' "$ROOT/mod/scripts/main.lua" \
+grep -Fq 'controls.NextTapeButton' "$ROOT/mod/scripts/main.lua" \
     || fail 'physical next button is not mapped to radio stations'
-grep -Fq 'tape_player.PreviousTapeButton' "$ROOT/mod/scripts/main.lua" \
+grep -Fq 'controls.PreviousTapeButton' "$ROOT/mod/scripts/main.lua" \
     || fail 'physical previous button is not mapped to radio stations'
+grep -Fq 'tape_player[name] = nil' "$ROOT/mod/scripts/main.lua" \
+    || fail 'vanilla cassette controls are not disabled'
+if grep -Eq 'os\.execute|start ""' "$ROOT/mod/scripts/radio.lua"; then
+  fail 'radio helper still launches through a focus-stealing command shell'
+fi
+grep -Fq 'package.loadlib(path, "rvtn_launch")' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'radio helper does not use the in-process native launcher'
+grep -Fq 'CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP' "$ROOT/bridge/rv_radio_launcher.c" \
+    || fail 'radio bridge child process is not launched hidden'
 
 [[ -f "$ROOT/mod/bin/rv-radio-bridge.exe" ]] || fail 'bundled radio bridge is missing'
+[[ -f "$ROOT/mod/bin/rv-radio-launcher.dll" ]] || fail 'bundled hidden launcher is missing'
+[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/rv-radio-launcher.dll" | tr -d ' ')" == '4d5a' ]] \
+    || fail 'bundled hidden launcher is not a Windows DLL'
 [[ -f "$ROOT/mod/bin/accuradio-resolver.js" ]] || fail 'bundled AccuRadio resolver is missing'
 grep -Fq 'JSON.parse' "$ROOT/mod/bin/accuradio-resolver.js" \
     || fail 'AccuRadio resolver must use structured JSON parsing'

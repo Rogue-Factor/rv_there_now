@@ -9,6 +9,8 @@
 static wchar_t g_spatial_path[MAX_PATH];
 static volatile LONG g_left_gain = SPATIAL_SCALE;
 static volatile LONG g_right_gain = SPATIAL_SCALE;
+static float g_current_left = 1.0f;
+static float g_current_right = 1.0f;
 
 static LONG clamp_gain(double gain)
 {
@@ -45,14 +47,18 @@ void spatial_audio_update(void)
 
 void spatial_audio_apply_f32(float* samples, size_t frames, unsigned int channels)
 {
-    const float left = (float)InterlockedCompareExchange(&g_left_gain, 0, 0)
+    const float target_left = (float)InterlockedCompareExchange(&g_left_gain, 0, 0)
         / (float)SPATIAL_SCALE;
-    const float right = (float)InterlockedCompareExchange(&g_right_gain, 0, 0)
+    const float target_right = (float)InterlockedCompareExchange(&g_right_gain, 0, 0)
         / (float)SPATIAL_SCALE;
+    float left = g_current_left;
+    float right = g_current_right;
     size_t frame;
     if (channels == 0) return;
     for (frame = 0; frame < frames; ++frame) {
         float* sample = samples + frame * channels;
+        left += (target_left - left) * 0.0025f;
+        right += (target_right - right) * 0.0025f;
         if (channels == 1) {
             sample[0] *= (left + right) * 0.5f;
         } else {
@@ -60,35 +66,52 @@ void spatial_audio_apply_f32(float* samples, size_t frames, unsigned int channel
             sample[1] *= right;
         }
     }
+    g_current_left = left;
+    g_current_right = right;
 }
 
 void spatial_audio_apply_s16(int16_t* samples, size_t frames, unsigned int channels)
 {
-    const LONG left = InterlockedCompareExchange(&g_left_gain, 0, 0);
-    const LONG right = InterlockedCompareExchange(&g_right_gain, 0, 0);
+    const float target_left = (float)InterlockedCompareExchange(&g_left_gain, 0, 0)
+        / (float)SPATIAL_SCALE;
+    const float target_right = (float)InterlockedCompareExchange(&g_right_gain, 0, 0)
+        / (float)SPATIAL_SCALE;
+    float left = g_current_left;
+    float right = g_current_right;
     size_t frame;
     if (channels == 0) return;
     for (frame = 0; frame < frames; ++frame) {
         int16_t* sample = samples + frame * channels;
+        left += (target_left - left) * 0.0025f;
+        right += (target_right - right) * 0.0025f;
         if (channels == 1) {
-            sample[0] = (int16_t)(((LONG)sample[0] * ((left + right) / 2))
-                / SPATIAL_SCALE);
+            sample[0] = (int16_t)((float)sample[0] * (left + right) * 0.5f);
         } else {
-            sample[0] = (int16_t)(((LONG)sample[0] * left) / SPATIAL_SCALE);
-            sample[1] = (int16_t)(((LONG)sample[1] * right) / SPATIAL_SCALE);
+            sample[0] = (int16_t)((float)sample[0] * left);
+            sample[1] = (int16_t)((float)sample[1] * right);
         }
     }
+    g_current_left = left;
+    g_current_right = right;
 }
 
 void spatial_audio_mono_to_stereo_s16(
     const int16_t* input, int16_t* output, size_t frames)
 {
-    const LONG left = InterlockedCompareExchange(&g_left_gain, 0, 0);
-    const LONG right = InterlockedCompareExchange(&g_right_gain, 0, 0);
+    const float target_left = (float)InterlockedCompareExchange(&g_left_gain, 0, 0)
+        / (float)SPATIAL_SCALE;
+    const float target_right = (float)InterlockedCompareExchange(&g_right_gain, 0, 0)
+        / (float)SPATIAL_SCALE;
+    float left = g_current_left;
+    float right = g_current_right;
     size_t frame;
     for (frame = 0; frame < frames; ++frame) {
-        const LONG sample = input[frame];
-        output[frame * 2] = (int16_t)((sample * left) / SPATIAL_SCALE);
-        output[frame * 2 + 1] = (int16_t)((sample * right) / SPATIAL_SCALE);
+        const float sample = (float)input[frame];
+        left += (target_left - left) * 0.0025f;
+        right += (target_right - right) * 0.0025f;
+        output[frame * 2] = (int16_t)(sample * left);
+        output[frame * 2 + 1] = (int16_t)(sample * right);
     }
+    g_current_left = left;
+    g_current_right = right;
 }

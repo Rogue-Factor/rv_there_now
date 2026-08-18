@@ -61,26 +61,43 @@ function sync:publish_stop()
     table.insert(published, event)
     return event
 end
+function sync:publish_volume(volume)
+    local event = { state = "volume", serial = "host-volume", volume = volume }
+    table.insert(published, event)
+    return event
+end
 function sync:poll() return nil end
 
-local commands = {}
+local launches = {}
 local messages = {}
 local url_path = os.tmpname() .. ".url"
 local status_path = os.tmpname() .. ".status"
 local youtube_path = os.tmpname() .. ".m4a"
+local stop_path = os.tmpname() .. ".stop"
+local launch_path = os.tmpname() .. ".launch"
+local function recording_launcher(path)
+    return function()
+        local file = assert(io.open(path, "rb"))
+        table.insert(launches, file:read("*all"))
+        file:close()
+        os.remove(path)
+    end
+end
+local function noop_loader()
+    return function() end
+end
 local radio = Radio.new({
     bridge_path = "C:\\Mods\\RVThereNow\\bin\\rv-radio-bridge.exe",
     status_path = status_path,
     url_path = url_path,
     youtube_path = youtube_path,
+    stop_path = stop_path,
+    launch_path = launch_path,
     get_player_controller = function() return controller end,
     get_server_time = function() return 100 end,
     bridge_available = function() return true end,
     read_status = function() return nil end,
-    execute = function(command)
-        table.insert(commands, command)
-        return true
-    end,
+    load_launcher = function() return recording_launcher(launch_path) end,
     sync = sync,
     log = function(message) table.insert(messages, message) end,
 })
@@ -99,36 +116,37 @@ assert(radio.backend == "youtube")
 assert(radio.target_time == 112)
 assert(#published == 1 and published[1].url == "https://youtu.be/test")
 assert(audio.stopped)
-assert(#commands == 2)
-assert(commands[1]:find("--stop", 1, true))
-assert(commands[2]:find("--prepare-youtube", 1, true))
-assert(commands[2]:find("--watch Ride-Win64-Shipping.exe", 1, true))
+assert(#launches == 1 and launches[1] == "youtube")
 local url_file = assert(io.open(url_path, "rb"))
 assert(url_file:read("*all") == "https://youtu.be/test")
 url_file:close()
 
-assert(radio:on_tape_state(true))
-assert(radio.play_signal_seen)
-assert(radio:on_tape_state(false))
+radio:stop("Stopped at RV radio")
 assert(radio.state == "OFF")
 assert(radio.detail == "Stopped at RV radio")
 assert(#published == 2 and published[2].state == "stop")
-assert(#commands == 3 and commands[3]:find("--stop", 1, true))
+assert(#launches == 1)
+local stop_file = assert(io.open(stop_path, "rb"))
+assert(stop_file:read("*all") == "stop")
+stop_file:close()
 
-local restart_command_count = #commands
-assert(radio:on_tape_state(true))
+local restart_launch_count = #launches
+assert(radio:start())
 assert(radio.state == "PREPARING")
-assert(radio.play_signal_seen)
 assert(#published == 3 and published[3].state == "play")
-assert(#commands == restart_command_count + 2)
-assert(commands[#commands]:find("--prepare-youtube", 1, true))
+assert(#launches == restart_launch_count + 1)
+assert(launches[#launches] == "youtube")
+assert(radio:adjust_volume(0.2) == 0.7)
+assert(published[#published].state == "volume")
+assert(published[#published].volume == 0.7)
 radio:stop()
 
 local failed = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,
     bridge_available = function() return false end,
-    execute = function() return true end,
+    load_launcher = noop_loader,
+    stop_path = os.tmpname() .. ".stop",
 })
 assert(not failed:start())
 assert(failed.state == "FAILED")
@@ -138,7 +156,8 @@ local unsynchronized = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,
     bridge_available = function() return true end,
-    execute = function() return true end,
+    load_launcher = noop_loader,
+    stop_path = os.tmpname() .. ".stop",
     get_player_count = function() return 2 end,
     sync = {
         publish_start = function()
@@ -156,8 +175,9 @@ local solo_unsynchronized = Radio.new({
     status_path = status_path,
     url_path = url_path,
     youtube_path = youtube_path,
+    stop_path = stop_path,
     bridge_available = function() return true end,
-    execute = function() return true end,
+    load_launcher = noop_loader,
     get_server_time = function() return 100 end,
     get_player_count = function() return 1 end,
     sync = {
@@ -192,7 +212,7 @@ local file_radio = Radio.new({
     confirmed_path = media_confirmed_path,
     spatial_path = media_spatial_path,
     bridge_available = function() return true end,
-    execute = function() return true end,
+    load_launcher = noop_loader,
     get_server_time = function() return media_now end,
     read_status = function()
         return string.format("STREAM_PCM %s\t44100\t1\t8", media_prefix)
@@ -249,10 +269,8 @@ local stream_radio = Radio.new({
     confirmed_path = stream_confirmed_path,
     spatial_path = stream_spatial_path,
     bridge_available = function() return true end,
-    execute = function(command)
-        table.insert(commands, command)
-        return true
-    end,
+    launch_path = launch_path,
+    load_launcher = function() return recording_launcher(launch_path) end,
     get_server_time = function() return stream_now end,
     read_status = function()
         return string.format("STREAM_PCM %s\t48000\t1\t8", stream_prefix)
@@ -261,7 +279,7 @@ local stream_radio = Radio.new({
 })
 assert(stream_radio:set_url("https://example.com/live.mp3"))
 assert(stream_radio:start())
-assert(commands[#commands]:find("--stream-pcm", 1, true))
+assert(launches[#launches] == "stream")
 stream_now = 305
 stream_radio:update()
 assert(stream_radio.state == "PREPARING")
@@ -295,6 +313,8 @@ assert(not io.open(stream_confirmed_path, "rb"))
 os.remove(url_path)
 os.remove(status_path)
 os.remove(youtube_path)
+os.remove(stop_path)
+os.remove(launch_path)
 os.remove(media_spatial_path)
 os.remove(stream_spatial_path)
 os.remove(string.format("%s.%06d.pcm", stream_prefix, 0))

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.16.0
+
+- Replace the vanilla cassette Play, Stop, volume, next, and previous actions with internet-radio-only controls.
+- Remove the cassette mesh and prevent the finite tape index from changing or going out of range.
+- Synchronize radio volume independently from playback so active stations remain available to late joiners.
+- Smooth positional gain changes in the native audio callback and reduce control-file updates to prevent volume dropouts.
+- Stop repeatedly interrupting the game's cassette audio component during native playback.
+- Launch the radio worker as a hidden Windows process and stop it through a control file without opening command prompts or stealing game focus.
+
 ## 0.15.1
 
 - Add a standalone release archive containing the tested UE4SS build for one-drag manual installation.

@@ -1,5 +1,5 @@
 local MOD_NAME = "RVThereNow"
-local MOD_VERSION = "0.15.1"
+local MOD_VERSION = "0.16.0"
 local MIN_PLAYERS = 4
 local MAX_PLAYERS = 24
 local PLAYER_ROWS = 8
@@ -76,6 +76,7 @@ local State = {
     ui = nil,
     tape_hooks = {},
     tape_hooks_attempted = false,
+    tape_controls = {},
 }
 
 local COLORS = {
@@ -490,77 +491,114 @@ end
 
 local select_station
 
-local function register_tape_control_hooks()
-    if State.tape_hooks_attempted then
-        return
+local function neutralize_tape_players()
+    local ok, tape_players = pcall(FindAllOf, "BP_TapePlayer_C")
+    if not ok or not tape_players then return end
+    for _, tape_player in ipairs(tape_players) do
+        local address = is_valid(tape_player) and unreal_address(tape_player) or nil
+        local existing = address and State.tape_controls[address] or nil
+        if existing and (not is_valid(existing.tape_player)
+            or not same_unreal_object(existing.tape_player, tape_player)) then
+            State.tape_controls[address] = nil
+        end
+        if address and not State.tape_controls[address] then
+            local controls = {}
+            local complete = true
+            for _, name in ipairs({
+                "PlayButton", "StopButton", "UpVolumeButton", "DownVolumeButton",
+                "NextTapeButton", "PreviousTapeButton",
+            }) do
+                local captured = false
+                pcall(function()
+                    controls[name] = tape_player[name]
+                    captured = is_valid(controls[name])
+                end)
+                if not captured then complete = false end
+            end
+            if complete then
+                local disabled = true
+                for name in pairs(controls) do
+                    local remaining = nil
+                    local cleared = pcall(function()
+                        tape_player[name] = nil
+                        remaining = tape_player[name]
+                    end)
+                    disabled = disabled and cleared and not is_valid(remaining)
+                end
+                if disabled then
+                    pcall(function()
+                        local cassette = tape_player.SM_CassetteTape_Austin_01
+                        if is_valid(cassette) then
+                            cassette:SetVisibility(false, true)
+                            cassette:SetHiddenInGame(true, true)
+                        end
+                    end)
+                    controls.tape_player = tape_player
+                    State.tape_controls[address] = controls
+                    log("Cassette controls replaced with internet-radio controls")
+                else
+                    for name, control in pairs(controls) do
+                        pcall(function() tape_player[name] = control end)
+                    end
+                end
+            end
+        end
     end
-    State.tape_hooks_attempted = true
+end
 
+local function register_tape_control_hooks()
     pcall(function()
         LoadAsset("/Game/Ride/Vehicle/Blueprints/BP_TapePlayer")
     end)
+    neutralize_tape_players()
+    if State.tape_hooks_attempted then return end
+    State.tape_hooks_attempted = true
+
     local class_path = "/Game/Ride/Vehicle/Blueprints/BP_TapePlayer.BP_TapePlayer_C:"
-    local registered = 0
-    for _, function_name in ipairs({
-        "Interact",
-        "SetPlaying",
-        "OnRep_IsPlaying",
-        "Internal_StopPlaying",
-        "OnRep_VolumeMultiplier",
-    }) do
-        local callback
-        if function_name == "Interact" then
-            callback = function(context, _, hit_result)
-                local tape_player = unwrap(context)
-                local authority = false
-                pcall(function() authority = tape_player:HasAuthority() == true end)
-                if not authority then return end
-                local component = resolve_hit_component(hit_result)
-                local direction = 0
-                pcall(function()
-                    if same_unreal_object(component, tape_player.NextTapeButton) then
-                        direction = 1
-                    elseif same_unreal_object(component, tape_player.PreviousTapeButton) then
-                        direction = -1
-                    end
-                end)
-                if direction ~= 0 and select_station then
-                    select_station(State.station_index + direction)
-                    refresh_ui()
-                end
-            end
-        elseif function_name == "SetPlaying" then
-            callback = function(_, playing)
-                local value = false
-                pcall(function() value = playing:get() == true end)
-                if InternetRadio:on_tape_state(value) then
-                    State.status = InternetRadio:status_text()
-                end
-            end
-        elseif function_name == "OnRep_VolumeMultiplier" then
-            callback = function()
-                InternetRadio:update_volume()
-            end
-        else
-            callback = function(context)
-                local value = false
-                pcall(function() value = context:get().IsPlaying == true end)
-                if InternetRadio:on_tape_state(value) then
-                    State.status = InternetRadio:status_text()
-                end
-            end
+    local callback = function(context, _, hit_result)
+        local tape_player = unwrap(context)
+        local authority = false
+        pcall(function() authority = tape_player:HasAuthority() == true end)
+        if not authority then return end
+        local controls = State.tape_controls[unreal_address(tape_player)]
+        local component = resolve_hit_component(hit_result)
+        if not controls or not is_valid(component) then return end
+
+        local volume_changed = false
+        if same_unreal_object(component, controls.NextTapeButton) then
+            select_station(State.station_index + 1)
+        elseif same_unreal_object(component, controls.PreviousTapeButton) then
+            select_station(State.station_index - 1)
+        elseif same_unreal_object(component, controls.PlayButton) then
+            if not InternetRadio:is_active() then InternetRadio:start() end
+        elseif same_unreal_object(component, controls.StopButton) then
+            if InternetRadio:is_active() then InternetRadio:stop("Stopped at RV radio") end
+        elseif same_unreal_object(component, controls.UpVolumeButton) then
+            local volume = InternetRadio:adjust_volume(0.1)
+            State.status = string.format("Radio volume %d%%", math.floor(volume * 100 + 0.5))
+            volume_changed = true
+        elseif same_unreal_object(component, controls.DownVolumeButton) then
+            local volume = InternetRadio:adjust_volume(-0.1)
+            State.status = string.format("Radio volume %d%%", math.floor(volume * 100 + 0.5))
+            volume_changed = true
         end
-        local ok, pre_id, post_id = pcall(RegisterHook, class_path .. function_name, callback)
-        if ok then
-            table.insert(State.tape_hooks, {
-                path = class_path .. function_name,
-                pre = pre_id,
-                post = post_id,
-            })
-            registered = registered + 1
+        if not volume_changed and (same_unreal_object(component, controls.PlayButton)
+            or same_unreal_object(component, controls.StopButton)) then
+            State.status = InternetRadio:status_text()
         end
+        refresh_ui()
     end
-    log(string.format("Registered %d RV radio control hooks", registered))
+    local ok, pre_id, post_id = pcall(RegisterHook, class_path .. "Interact", callback)
+    if ok then
+        table.insert(State.tape_hooks, {
+            path = class_path .. "Interact",
+            pre = pre_id,
+            post = post_id,
+        })
+        log("Registered cassette-free RV radio controls")
+    else
+        State.tape_hooks_attempted = false
+    end
 end
 
 local function adjust_count(delta)
@@ -904,7 +942,7 @@ pcall(function()
 end)
 
 pcall(function()
-    LoopInGameThreadWithDelay(3000, register_tape_control_hooks)
+    LoopInGameThreadWithDelay(1000, register_tape_control_hooks)
 end)
 
 log(string.format("v%s loaded; F6 opens the menu and F7 toggles the radio test", MOD_VERSION))
