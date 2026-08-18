@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.17.0
+
+- Stop the local radio worker when the RV world unloads so playback cannot continue into the main menu.
+- Restore the bundled launcher DLL for Proton/Wine compatibility while keeping the radio worker hidden and console-free.
+- Add KONA 610 AM, WNYC, RNZ National, and BBC World Service to a compact two-column station chooser.
+- Parse ICY stream metadata and show the current song or program in the radio HUD.
+- Include AccuRadio artist and track names in the same now-playing display.
+- Keep synchronized playback controls host-only for both menu and physical radio input.
+- Move the active radio label to a fixed lower-right HUD position and reduce startup chunks from eight seconds to one.
+- Show player-cap controls only on the frontend and session radio/roster controls only during gameplay.
+
 ## 0.16.1
 
 - Keep every physical radio button visible while binding it to internet-radio behavior.

@@ -228,7 +228,7 @@ local file_radio = Radio.new({
     load_launcher = noop_loader,
     get_server_time = function() return media_now end,
     read_status = function()
-        return string.format("STREAM_PCM %s\t44100\t1\t8", media_prefix)
+        return string.format("STREAM_PCM %s\t44100\t1\t1", media_prefix)
     end,
     sync = media_sync,
 })
@@ -257,6 +257,7 @@ local stream_prefix = os.tmpname() .. "-stream"
 local stream_play_path = os.tmpname() .. ".play"
 local stream_confirmed_path = os.tmpname() .. ".playing"
 local stream_spatial_path = os.tmpname() .. ".spatial"
+local stream_now_playing_path = os.tmpname() .. ".nowplaying"
 local function write_chunk(sequence)
     local path = string.format("%s.%06d.pcm", stream_prefix, sequence)
     local file = assert(io.open(path, "wb"))
@@ -281,12 +282,13 @@ local stream_radio = Radio.new({
     play_path = stream_play_path,
     confirmed_path = stream_confirmed_path,
     spatial_path = stream_spatial_path,
+    now_playing_path = stream_now_playing_path,
     bridge_available = function() return true end,
     launch_path = launch_path,
     load_launcher = function() return recording_launcher(launch_path) end,
     get_server_time = function() return stream_now end,
     read_status = function()
-        return string.format("STREAM_PCM %s\t48000\t1\t8", stream_prefix)
+        return string.format("STREAM_PCM %s\t48000\t1\t1", stream_prefix)
     end,
     sync = stream_sync,
 })
@@ -315,13 +317,22 @@ stream_radio:maintain_audio()
 assert(audio.play_count == first_play_count)
 stream_radio:update()
 assert(stream_radio.state == "PLAYING")
+local now_playing_file = assert(io.open(stream_now_playing_path, "wb"))
+now_playing_file:write("Test Artist - Test Track")
+now_playing_file:close()
+stream_radio:update()
+assert(stream_radio:now_playing_text("fallback") == "Test Artist - Test Track")
 stream_now = 319.97
 stream_radio:maintain_audio()
 assert(stream_radio.stream_sequence == 0)
 assert(stream_radio.native_play_started)
-stream_radio:stop()
+tape_player.valid = false
+stream_radio:update()
+assert(stream_radio.state == "OFF", stream_radio.state .. ": " .. stream_radio.detail)
+assert(stream_radio.detail == "Left the RV session")
 assert(not io.open(stream_play_path, "rb"))
 assert(not io.open(stream_confirmed_path, "rb"))
+assert(not io.open(stream_now_playing_path, "rb"))
 
 os.remove(url_path)
 os.remove(status_path)

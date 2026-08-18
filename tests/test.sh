@@ -87,6 +87,12 @@ luac -p "$ROOT/mod/scripts/lobby_sync.lua"
 
 grep -Fq 'local MENU_ROWS = 5' "$ROOT/mod/scripts/main.lua" \
     || fail 'dashboard must use the five-row station layout'
+grep -Fq 'return State.in_game and { 4, 5 } or { 1, 3 }' "$ROOT/mod/scripts/main.lua" \
+    || fail 'dashboard controls are not separated between frontend and gameplay'
+grep -Fq '/game/ride/maps/frontend' "$ROOT/mod/scripts/main.lua" \
+    || fail 'dashboard does not identify the frontend world'
+grep -Fq '/game/ride/maps/ridemap' "$ROOT/mod/scripts/main.lua" \
+    || fail 'dashboard does not identify the gameplay world'
 grep -Fq 'RADIO STATION' "$ROOT/mod/scripts/main.lua" \
     || fail 'dashboard station selector is missing'
 if grep -Eq 'STREAM URL|row_values\[6\]|add_row\(ui, 6|EditableTextBox' "$ROOT/mod/scripts/main.lua"; then
@@ -99,6 +105,8 @@ grep -Fq 'local SYNC_LEAD_SECONDS = 12' "$ROOT/mod/scripts/radio.lua" \
     || fail 'radio must use the shortened synchronized startup lead'
 grep -Fq '#define STREAM_READY_CHUNKS 1' "$ROOT/bridge/rv_radio_bridge.c" \
     || fail 'radio bridge must become ready after its first stream chunk'
+grep -Fq '#define STREAM_CHUNK_SECONDS 1' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge must use one-second startup chunks'
 grep -Fq '#define STREAM_RETAIN_CHUNKS 3' "$ROOT/bridge/rv_radio_bridge.c" \
     || fail 'radio bridge must retain its recovery window'
 grep -Fq '#define STREAM_CHANNELS 1' "$ROOT/bridge/rv_radio_bridge.c" \
@@ -141,6 +149,19 @@ grep -Fq 'package.loadlib(path, "rvtn_launch")' "$ROOT/mod/scripts/radio.lua" \
     || fail 'radio helper does not use the in-process native launcher'
 grep -Fq 'CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP' "$ROOT/bridge/rv_radio_launcher.c" \
     || fail 'radio bridge child process is not launched hidden'
+grep -Fq 'read_launch_mode' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge cannot consume the no-argument Unreal launch request'
+grep -Fq 'Left the RV session' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'radio does not stop when its RV world is unloaded'
+grep -Fq 'Icy-MetaData: 1' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'live stream metadata is not requested'
+grep -Fq 'StreamTitle=' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'live stream title metadata is not parsed'
+grep -Fq 'add_bottom_right_child' "$ROOT/mod/scripts/main.lua" \
+    || fail 'static lower-right now-playing display is missing'
+if grep -Fq 'ProjectWorldLocationToScreen' "$ROOT/mod/scripts/main.lua"; then
+  fail 'now-playing display still follows the physical radio'
+fi
 
 [[ -f "$ROOT/mod/bin/rv-radio-bridge.exe" ]] || fail 'bundled radio bridge is missing'
 [[ -f "$ROOT/mod/bin/rv-radio-launcher.dll" ]] || fail 'bundled hidden launcher is missing'

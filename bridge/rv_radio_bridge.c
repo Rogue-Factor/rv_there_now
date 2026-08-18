@@ -24,7 +24,7 @@
 #define RELAY_PORT_LAST 18774
 #define STREAM_SAMPLE_RATE 48000
 #define STREAM_CHANNELS 1
-#define STREAM_CHUNK_SECONDS 8
+#define STREAM_CHUNK_SECONDS 1
 #define STREAM_READY_CHUNKS 1
 #define STREAM_RETAIN_CHUNKS 3
 #define ACCURADIO_MAX_TRACKS 64
@@ -38,6 +38,8 @@ typedef struct HttpStream {
     size_t rewind_cache_size;
     uint64_t cursor;
     uint64_t network_position;
+    DWORD icy_metaint;
+    DWORD icy_audio_remaining;
     volatile LONG ended;
     volatile LONG failed;
 } HttpStream;
@@ -52,6 +54,8 @@ static wchar_t g_url_path[MAX_PATH];
 static wchar_t g_play_path[MAX_PATH];
 static wchar_t g_confirm_path[MAX_PATH];
 static wchar_t g_stop_path[MAX_PATH];
+static wchar_t g_launch_path[MAX_PATH];
+static wchar_t g_now_playing_path[MAX_PATH];
 
 static void initialize_temp_paths(void)
 {
@@ -63,6 +67,8 @@ static void initialize_temp_paths(void)
         wcscpy(g_play_path, L"rv-there-now-radio.play");
         wcscpy(g_confirm_path, L"rv-there-now-radio.playing");
         wcscpy(g_stop_path, L"rv-there-now-radio.stop");
+        wcscpy(g_launch_path, L"rv-there-now-radio.launch");
+        wcscpy(g_now_playing_path, L"rv-there-now-radio.nowplaying");
         return;
     }
     _snwprintf(g_status_path, MAX_PATH - 1, L"%lsrv-there-now-radio.status", temp_path);
@@ -77,6 +83,37 @@ static void initialize_temp_paths(void)
     _snwprintf(g_stop_path, MAX_PATH - 1,
         L"%lsrv-there-now-radio.stop", temp_path);
     g_stop_path[MAX_PATH - 1] = L'\0';
+    _snwprintf(g_launch_path, MAX_PATH - 1,
+        L"%lsrv-there-now-radio.launch", temp_path);
+    g_launch_path[MAX_PATH - 1] = L'\0';
+    _snwprintf(g_now_playing_path, MAX_PATH - 1,
+        L"%lsrv-there-now-radio.nowplaying", temp_path);
+    g_now_playing_path[MAX_PATH - 1] = L'\0';
+}
+
+static int read_launch_mode(wchar_t mode[16])
+{
+    FILE* file = _wfopen(g_launch_path, L"rb");
+    char value[16];
+    size_t length;
+    if (file == NULL) return 0;
+    length = fread(value, 1, sizeof(value) - 1, file);
+    fclose(file);
+    DeleteFileW(g_launch_path);
+    while (length > 0 && (value[length - 1] == '\r' || value[length - 1] == '\n'
+            || value[length - 1] == ' ' || value[length - 1] == '\t')) {
+        --length;
+    }
+    value[length] = '\0';
+    if (strcmp(value, "stream") == 0) {
+        wcscpy(mode, L"--stream-pcm");
+        return 1;
+    }
+    if (strcmp(value, "youtube") == 0) {
+        wcscpy(mode, L"--prepare-youtube");
+        return 1;
+    }
+    return 0;
 }
 
 static int read_url_file(wchar_t* url, size_t capacity)
@@ -131,6 +168,19 @@ static void write_status(const wchar_t* status)
     fclose(file);
 }
 
+static void write_now_playing(const unsigned char* value, size_t length)
+{
+    FILE* file;
+    while (length > 0 && (value[length - 1] == '\0' || value[length - 1] == ' ')) {
+        --length;
+    }
+    if (length == 0 || length > 512) return;
+    file = _wfopen(g_now_playing_path, L"wb");
+    if (file == NULL) return;
+    fwrite(value, 1, length, file);
+    fclose(file);
+}
+
 static void close_http_stream(HttpStream* stream)
 {
     if (stream->request != NULL) {
@@ -146,7 +196,7 @@ static void close_http_stream(HttpStream* stream)
     memset(stream, 0, sizeof(*stream));
 }
 
-static int open_http_stream(const wchar_t* url, HttpStream* stream)
+static int open_http_stream(const wchar_t* url, HttpStream* stream, int request_metadata)
 {
     URL_COMPONENTS parts;
     wchar_t host[512];
@@ -156,7 +206,9 @@ static int open_http_stream(const wchar_t* url, HttpStream* stream)
     DWORD status_code = 0;
     DWORD status_size = sizeof(status_code);
     DWORD flags = 0;
-    const wchar_t* headers = L"Icy-MetaData: 0\r\nCache-Control: no-cache\r\n";
+    const wchar_t* headers = request_metadata
+        ? L"Icy-MetaData: 1\r\nCache-Control: no-cache\r\n"
+        : L"Icy-MetaData: 0\r\nCache-Control: no-cache\r\n";
 
     memset(stream, 0, sizeof(*stream));
     stream->rewind_cache = (unsigned char*)malloc(REWIND_CACHE_SIZE);
@@ -225,6 +277,80 @@ static int open_http_stream(const wchar_t* url, HttpStream* stream)
         close_http_stream(stream);
         return 0;
     }
+    if (request_metadata) {
+        wchar_t metaint[32];
+        DWORD metaint_size = sizeof(metaint);
+        if (WinHttpQueryHeaders(stream->request, WINHTTP_QUERY_CUSTOM,
+                L"icy-metaint", metaint, &metaint_size, WINHTTP_NO_HEADER_INDEX)) {
+            stream->icy_metaint = (DWORD)_wtoi(metaint);
+            stream->icy_audio_remaining = stream->icy_metaint;
+        }
+    }
+    return 1;
+}
+
+static int winhttp_read_exact(HINTERNET request, unsigned char* output, DWORD length)
+{
+    DWORD total = 0;
+    while (total < length) {
+        DWORD received = 0;
+        if (!WinHttpReadData(request, output + total, length - total, &received)
+            || received == 0) {
+            return 0;
+        }
+        total += received;
+    }
+    return 1;
+}
+
+static void consume_icy_metadata(HttpStream* stream)
+{
+    unsigned char length_byte = 0;
+    unsigned char metadata[4096 + 1];
+    DWORD metadata_length;
+    const char* marker;
+    const char* end;
+    if (!winhttp_read_exact(stream->request, &length_byte, 1)) {
+        InterlockedExchange(&stream->failed, 1);
+        InterlockedExchange(&stream->ended, 1);
+        return;
+    }
+    metadata_length = (DWORD)length_byte * 16;
+    if (metadata_length == 0) {
+        stream->icy_audio_remaining = stream->icy_metaint;
+        return;
+    }
+    if (metadata_length > sizeof(metadata) - 1
+        || !winhttp_read_exact(stream->request, metadata, metadata_length)) {
+        InterlockedExchange(&stream->failed, 1);
+        InterlockedExchange(&stream->ended, 1);
+        return;
+    }
+    metadata[metadata_length] = '\0';
+    marker = strstr((const char*)metadata, "StreamTitle='");
+    if (marker != NULL) {
+        marker += strlen("StreamTitle='");
+        end = strstr(marker, "';");
+        if (end != NULL && end > marker) {
+            write_now_playing((const unsigned char*)marker, (size_t)(end - marker));
+        }
+    }
+    stream->icy_audio_remaining = stream->icy_metaint;
+}
+
+static int read_stream_audio(HttpStream* stream, unsigned char* output,
+    DWORD requested, DWORD* received)
+{
+    *received = 0;
+    while (stream->icy_metaint > 0 && stream->icy_audio_remaining == 0) {
+        consume_icy_metadata(stream);
+        if (InterlockedCompareExchange(&stream->ended, 0, 0) != 0) return 0;
+    }
+    if (stream->icy_metaint > 0 && requested > stream->icy_audio_remaining) {
+        requested = stream->icy_audio_remaining;
+    }
+    if (!WinHttpReadData(stream->request, output, requested, received)) return 0;
+    if (stream->icy_metaint > 0) stream->icy_audio_remaining -= *received;
     return 1;
 }
 
@@ -245,7 +371,7 @@ static int download_http_file(const wchar_t* url, const wchar_t* path)
     FILE* output;
     int succeeded = 0;
 
-    if (!open_http_stream(url, &stream)) return 0;
+    if (!open_http_stream(url, &stream, 0)) return 0;
     output = _wfopen(path, L"wb");
     if (output == NULL) {
         close_http_stream(&stream);
@@ -302,6 +428,7 @@ static int extract_accuradio_channel(const wchar_t* url, wchar_t channel[25])
 static int resolve_accuradio_tracks(
     const wchar_t* channel,
     wchar_t tracks[ACCURADIO_MAX_TRACKS][4096],
+    char titles[ACCURADIO_MAX_TRACKS][512],
     int* track_count)
 {
     wchar_t temp[MAX_PATH];
@@ -356,9 +483,17 @@ static int resolve_accuradio_tracks(
     if (file == NULL) goto cleanup;
     while (count < ACCURADIO_MAX_TRACKS && fgets(line, sizeof(line), file) != NULL) {
         size_t length = strcspn(line, "\r\n");
+        char* separator;
         line[length] = '\0';
-        if (length == 0 || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        separator = strchr(line, '\t');
+        if (separator == NULL) continue;
+        *separator = '\0';
+        ++separator;
+        if (line[0] == '\0' || separator[0] == '\0'
+            || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                 line, -1, tracks[count], 4096) <= 0) continue;
+        strncpy(titles[count], separator, sizeof(titles[count]) - 1);
+        titles[count][sizeof(titles[count]) - 1] = '\0';
         ++count;
     }
     fclose(file);
@@ -401,7 +536,7 @@ static ma_result decoder_read(ma_decoder* decoder, void* output, size_t bytes_to
                 ? UINT32_MAX
                 : (DWORD)(bytes_to_read - total);
             DWORD received = 0;
-            if (!WinHttpReadData(stream->request, destination + total, requested, &received)) {
+            if (!read_stream_audio(stream, destination + total, requested, &received)) {
                 InterlockedExchange(&stream->failed, 1);
                 InterlockedExchange(&stream->ended, 1);
                 *bytes_read = total;
@@ -584,7 +719,7 @@ static int run_bridge(const wchar_t* url, float volume, const wchar_t* watched_p
         return 2;
     }
     write_status(L"OPENING HTTP");
-    if (!open_http_stream(url, &stream)) {
+    if (!open_http_stream(url, &stream, 1)) {
         write_status(L"ERROR HTTP connection failed");
         CloseHandle(stop_event);
         return 3;
@@ -745,7 +880,7 @@ static int run_relay(const wchar_t* url, const wchar_t* watched_process)
         if (client == INVALID_SOCKET) continue;
 
         received = recv(client, request, sizeof(request), 0);
-        if (received <= 0 || !open_http_stream(url, &stream)) {
+        if (received <= 0 || !open_http_stream(url, &stream, 0)) {
             closesocket(client);
             write_status(ready_status);
             continue;
@@ -1019,7 +1154,7 @@ static int run_stream_pcm(const wchar_t* url, const wchar_t* watched_process)
         write_status(L"ERROR Could not acquire bridge event");
         return 60;
     }
-    if (!open_http_stream(url, &stream)) {
+    if (!open_http_stream(url, &stream, 1)) {
         write_status(L"ERROR HTTP connection failed");
         CloseHandle(stop_event);
         return 61;
@@ -1132,6 +1267,7 @@ static int run_accuradio_pcm(const wchar_t* url, const wchar_t* watched_process)
     wchar_t decoded_path[MAX_PATH];
     wchar_t status[MAX_PATH + 96];
     wchar_t tracks[ACCURADIO_MAX_TRACKS][4096];
+    char titles[ACCURADIO_MAX_TRACKS][512];
     unsigned char* chunk = NULL;
     size_t chunk_size = 0;
     size_t chunk_used = 0;
@@ -1169,7 +1305,7 @@ static int run_accuradio_pcm(const wchar_t* url, const wchar_t* watched_process)
         int track_count = 0;
         int track_index;
         write_status(L"OPENING AccuRadio playlist");
-        if (!resolve_accuradio_tracks(channel, tracks, &track_count)) {
+        if (!resolve_accuradio_tracks(channel, tracks, titles, &track_count)) {
             write_status(L"ERROR Could not resolve AccuRadio playlist");
             exit_code = 73;
             break;
@@ -1182,6 +1318,8 @@ static int run_accuradio_pcm(const wchar_t* url, const wchar_t* watched_process)
 
             if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
                 || !process_is_running(watched_process)) goto cleanup;
+            write_now_playing((const unsigned char*)titles[track_index],
+                strlen(titles[track_index]));
             write_status(sequence < STREAM_READY_CHUNKS
                 ? L"BUFFERING AccuRadio tracks"
                 : L"PLAYING AccuRadio track queue");
@@ -1434,8 +1572,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     wchar_t** arguments;
     float volume = 0.5f;
     const wchar_t* watched_process = NULL;
+    const wchar_t* operation;
     const wchar_t* url;
     wchar_t url_from_file[4096];
+    wchar_t launch_mode[16];
     int index;
     int result;
     (void)instance;
@@ -1446,28 +1586,44 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
     initialize_temp_paths();
     spatial_audio_initialize();
     arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
-    if (arguments == NULL || argument_count < 2) {
-        write_status(L"ERROR Missing stream URL");
+    if (arguments == NULL) {
+        write_status(L"ERROR Could not read radio helper arguments");
         return 1;
     }
-    if (wcscmp(arguments[1], L"--stop") == 0) {
+    if (argument_count < 2) {
+        if (!read_launch_mode(launch_mode)) {
+            write_status(L"ERROR Missing radio launch request");
+            LocalFree(arguments);
+            return 1;
+        }
+        operation = launch_mode;
+        watched_process = L"Ride-Win64-Shipping.exe";
+    } else {
+        operation = arguments[1];
+    }
+    if (wcscmp(operation, L"--stop") == 0) {
         result = signal_existing_bridge() ? 0 : 1;
         LocalFree(arguments);
         return result;
     }
     DeleteFileW(g_confirm_path);
-    if (wcscmp(arguments[1], L"--url-file") == 0
-        || wcscmp(arguments[1], L"--relay") == 0
-        || wcscmp(arguments[1], L"--stream-pcm") == 0
-        || wcscmp(arguments[1], L"--prepare-youtube") == 0) {
+    DeleteFileW(g_now_playing_path);
+    if (wcscmp(operation, L"--url-file") == 0
+        || wcscmp(operation, L"--relay") == 0
+        || wcscmp(operation, L"--stream-pcm") == 0
+        || wcscmp(operation, L"--prepare-youtube") == 0) {
         if (!read_url_file(url_from_file, sizeof(url_from_file) / sizeof(url_from_file[0]))) {
             write_status(L"ERROR Invalid or missing stream URL");
             LocalFree(arguments);
             return 1;
         }
         url = url_from_file;
-    } else {
+    } else if (argument_count >= 2) {
         url = arguments[1];
+    } else {
+        write_status(L"ERROR Invalid radio launch request");
+        LocalFree(arguments);
+        return 1;
     }
     for (index = 2; index + 1 < argument_count; index += 2) {
         if (wcscmp(arguments[index], L"--volume") == 0) {
@@ -1480,19 +1636,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         }
     }
 
-    if (wcscmp(arguments[1], L"--prepare-youtube") == 0) {
+    if (wcscmp(operation, L"--prepare-youtube") == 0) {
         result = youtube_is_url(url)
             ? run_youtube_prepare(watched_process)
             : 52;
         if (result == 52) write_status(L"ERROR Source is not a YouTube URL");
-    } else if (wcscmp(arguments[1], L"--relay") == 0) {
+    } else if (wcscmp(operation, L"--relay") == 0) {
         result = run_relay(url, watched_process);
-    } else if (wcscmp(arguments[1], L"--stream-pcm") == 0) {
+    } else if (wcscmp(operation, L"--stream-pcm") == 0) {
         wchar_t accuradio_channel[25];
         result = extract_accuradio_channel(url, accuradio_channel)
             ? run_accuradio_pcm(url, watched_process)
             : run_stream_pcm(url, watched_process);
-    } else if (youtube_is_url(url) && wcscmp(arguments[1], L"--url-file") == 0) {
+    } else if (youtube_is_url(url) && wcscmp(operation, L"--url-file") == 0) {
         result = run_youtube_bridge(volume, watched_process);
     } else {
         result = run_bridge(url, volume, watched_process);

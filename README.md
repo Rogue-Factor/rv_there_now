@@ -10,20 +10,23 @@ The game is designed for four players. Eight is the recommended expanded cap; la
 - **F7** starts or stops the selected internet station while you are in the RV.
 - **Up/Down** selects a row and **Left/Right** changes its value.
 - **Enter** activates the selected row and **Escape** closes the menu.
+- On the main menu, the dashboard shows only Player Cap and Apply. In a game, it shows the radio and player roster while hiding lobby-creation settings.
 - Select **Radio Station** and press **Enter** to open the station list. Use **Up/Down** and **Enter** to choose, or **Escape** to cancel. **Left/Right** cycles stations directly.
 - The live roster shows player names, ping, and connection state, with Page Up/Down for larger sessions.
 - The optional compact HUD shows the live player count, applied cap, and average remote ping.
 - Selecting a cap of four and applying it restores the vanilla lobby size.
 
-The **Internet Radio** row plays the selected station through the bundled radio bridge. The catalog includes AccuRadio Summer Hits '76 and seven verified SomaFM stations spanning ambient, lounge, seventies rock, synthpop, indie pop, and electronic music.
+The **Internet Radio** row plays the selected station through the bundled radio bridge. The 12-station catalog includes AccuRadio Summer Hits '76, seven music stations, and four talk choices: KONA 610 AM, WNYC, RNZ National, and BBC World Service. KONA is a current Coast to Coast AM affiliate; programming follows the station's live schedule.
 
-SomaFM MP3 stations are decoded continuously into eight-second mono PCM chunks. The bundled Windows bridge owns the audio device and consumes those chunks continuously after Lua releases the synchronized start gate. The menu reports playback only after the device callback consumes nonzero decoded samples.
+Live MP3 stations are decoded continuously into one-second mono PCM chunks. The bundled Windows bridge owns the audio device and consumes those chunks continuously after Lua releases the synchronized start gate. The menu reports playback only after the device callback consumes nonzero decoded samples. ICY metadata and AccuRadio playlist data feed a small current-song or current-program label fixed in the lower-right corner.
 
 AccuRadio is resolved through its playlist endpoint. The bundled QuickJS runtime parses the playlist, and the bridge downloads and decodes its M4A tracks into the same continuous PCM queue. YouTube sources are downloaded and decoded locally through the bundled tools, then staged into that queue. No machine-installed media tools or runtimes are required.
 
 The host publishes the source, shared start time, and radio volume through Steam lobby metadata, with Steam rich presence as a fallback for sessions that do not expose their lobby. Every modded player resolves the source locally. Lua sends the bridge per-client distance and stereo pan computed from the RV and listener positions. The RV radio's physical Play, Stop, volume, previous, and next buttons remain visible and control internet radio directly; vanilla cassettes are hidden and their finite tape index is reset after input. Previous and next wrap around the station catalog. Only the host can stop or change an active synchronized station, so clients cannot silence their local copy independently. Every player who should hear internet radio must install the mod.
 
-The bridge launches its audio worker without a console window, watches the game process, and exits automatically when the game closes.
+UE4SS loads the bundled launcher DLL, which starts the bridge as a hidden Windows process in the game's own Windows or Proton environment. It does not open a console or invoke a desktop file association. The bridge watches the game process, and Lua stops it as soon as the RV world unloads, including when returning to the main menu.
+
+Antivirus software can quarantine unsigned community-mod binaries. Norton may terminate the game when it blocks `rv-radio-launcher.dll`; use only the file from the official release, verify the release checksum, and report or allow that verified file. Disabling antivirus protection globally is not recommended.
 
 Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` class default. Create a new lobby after applying it. The first change also creates a one-time backup beside `Game.ini`.
 

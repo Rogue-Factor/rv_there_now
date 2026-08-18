@@ -1,5 +1,5 @@
 local MOD_NAME = "RVThereNow"
-local MOD_VERSION = "0.16.1"
+local MOD_VERSION = "0.17.0"
 local MIN_PLAYERS = 4
 local MAX_PLAYERS = 24
 local PLAYER_ROWS = 8
@@ -46,6 +46,30 @@ local RADIO_STATIONS = {
         detail = "Electronic hacker radio",
         url = "https://ice5.somafm.com/defcon-128-mp3",
     },
+    {
+        name = "KONA 610 AM",
+        detail = "News, talk, and Coast to Coast overnight",
+        now_playing = "Live news and talk / Coast to Coast overnight",
+        url = "https://live.amperwave.net/direct/townsquare-konaammp3-ibc3",
+    },
+    {
+        name = "WNYC 93.9",
+        detail = "Public radio news and conversation",
+        now_playing = "Live public radio from New York",
+        url = "https://fm939.wnyc.org/wnycfm",
+    },
+    {
+        name = "RNZ NATIONAL",
+        detail = "News, interviews, readings, and features",
+        now_playing = "RNZ National live programming",
+        url = "http://radionz-ice.streamguys.com/national.mp3",
+    },
+    {
+        name = "BBC WORLD SERVICE",
+        detail = "Global news, documentaries, and discussion",
+        now_playing = "BBC World Service live programming",
+        url = "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
+    },
 }
 
 local script_source = debug.getinfo(1, "S").source:gsub("^@", "")
@@ -64,6 +88,7 @@ local State = {
     status = "Ready",
     session_players = 0,
     session_role = "MENU",
+    in_game = false,
     players = {},
     average_ping = nil,
     player_page = 1,
@@ -244,6 +269,19 @@ local function add_canvas_child(canvas, child, x, y, width, height, z_order)
     return slot
 end
 
+local function add_bottom_right_child(canvas, child, x, y, width, height, z_order)
+    local slot = canvas:AddChild(child)
+    slot:SetAnchors({
+        Minimum = { X = 1.0, Y = 1.0 },
+        Maximum = { X = 1.0, Y = 1.0 },
+    })
+    slot:SetAlignment({ X = 0.0, Y = 0.0 })
+    slot:SetPosition({ X = x, Y = y })
+    slot:SetSize({ X = width, Y = height })
+    slot:SetZOrder(z_order or 1)
+    return slot
+end
+
 local function create_text(tree, classes, value, color, font_size, justification)
     local widget = StaticConstructObject(classes.text, tree)
     set_text(widget, value)
@@ -287,9 +325,10 @@ local function add_row(ui, index, y, label)
     track(ui, border, true)
     ui.rows[index] = border
 
-    add_label(ui, label, -412, y + 7, 176, 25, COLORS.muted, 14, true)
+    local row_label = add_label(ui, label, -412, y + 7, 176, 25, COLORS.muted, 14, true)
     local value = add_label(ui, "", -231, y + 5, 160, 27, COLORS.text, 16, true)
     ui.row_values[index] = value
+    ui.row_widgets[index] = { border, row_label, value }
     return value
 end
 
@@ -309,7 +348,7 @@ local function update_session_snapshot()
         return
     end
 
-    local ok, players, role, roster, average_ping = pcall(function()
+    local ok, players, role, roster, average_ping, in_game = pcall(function()
         local player_states = {}
         local world = player_controller:GetWorld()
         if is_valid(world) and is_valid(world.GameState) and world.GameState.PlayerArray then
@@ -376,8 +415,25 @@ local function update_session_snapshot()
             end
         end
 
+        local world_identity = ""
+        pcall(function()
+            world_identity = tostring(world:GetFullName())
+        end)
+        pcall(function()
+            world_identity = world_identity .. " "
+                .. tostring(world.CommittedPersistentLevelName:ToString())
+        end)
+        local lower_world = world_identity:lower()
+        local gameplay = #rows > 0
+        if lower_world:find("/game/ride/maps/frontend", 1, true) then
+            gameplay = false
+        elseif lower_world:find("/game/ride/maps/ridemap", 1, true)
+            or lower_world:find("ridemap", 1, true) then
+            gameplay = true
+        end
+
         local average = ping_count > 0 and math.floor(ping_total / ping_count + 0.5) or nil
-        return #rows, is_host and "HOST" or "CLIENT", rows, average
+        return #rows, is_host and "HOST" or "CLIENT", rows, average, gameplay
     end)
 
     if ok then
@@ -385,7 +441,46 @@ local function update_session_snapshot()
         State.session_role = role
         State.players = roster
         State.average_ping = average_ping
+        State.in_game = in_game == true
+        if not State.in_game then
+            State.session_role = "MENU"
+        end
     end
+end
+
+local function visible_menu_rows()
+    return State.in_game and { 4, 5 } or { 1, 3 }
+end
+
+local function normalize_menu_selection()
+    local rows = visible_menu_rows()
+    for _, row in ipairs(rows) do
+        if State.selected_row == row then return end
+    end
+    State.selected_row = rows[1]
+    State.station_list_open = false
+end
+
+local function set_menu_widgets_visible(visible)
+    if not State.ui then return end
+    local ui = State.ui
+    for _, widget in ipairs(ui.menu_widgets) do
+        set_visibility(widget, visible)
+    end
+
+    local allowed = {}
+    for _, row in ipairs(visible_menu_rows()) do allowed[row] = true end
+    for index, widgets in ipairs(ui.row_widgets) do
+        for _, widget in ipairs(widgets) do
+            set_visibility(widget, visible and allowed[index] == true)
+        end
+    end
+    for _, widget in ipairs(ui.game_widgets) do
+        set_visibility(widget, visible and State.in_game)
+    end
+    pcall(function()
+        ui.panel_slot:SetSize({ X = 470, Y = State.in_game and 450 or 180 })
+    end)
 end
 
 local function row_color(index)
@@ -408,8 +503,16 @@ local function refresh_ui()
     end
 
     update_session_snapshot()
+    normalize_menu_selection()
+    set_menu_widgets_visible(State.open)
     local previous_radio_state = InternetRadio.state
     InternetRadio:update()
+    for index, station in ipairs(RADIO_STATIONS) do
+        if station.url == InternetRadio.url then
+            State.station_index = index
+            break
+        end
+    end
     if State.selected_row == 5 and InternetRadio:is_active() then
         State.status = InternetRadio:status_text()
     end
@@ -432,13 +535,13 @@ local function refresh_ui()
 
     set_text(ui.status_text, State.status)
     for index, widget in ipairs(ui.station_options) do
-        local dropdown_visible = State.open and State.station_list_open
+        local dropdown_visible = State.open and State.in_game and State.station_list_open
         set_visibility(widget, dropdown_visible)
         if dropdown_visible then
             set_text_color(widget, index == State.station_cursor and COLORS.green or COLORS.text)
         end
     end
-    set_visibility(ui.station_dropdown, State.open and State.station_list_open)
+    set_visibility(ui.station_dropdown, State.open and State.in_game and State.station_list_open)
 
     if State.selected_row == 4 then
         local station = RADIO_STATIONS[State.station_list_open
@@ -485,8 +588,18 @@ local function refresh_ui()
             set_text(ui.player_statuses[row], "")
         end
     end
-    set_visibility(ui.hud_border, State.hud_enabled and not State.open)
-    set_visibility(ui.hud_text, State.hud_enabled and not State.open)
+    set_visibility(ui.hud_border, State.in_game and State.hud_enabled and not State.open)
+    set_visibility(ui.hud_text, State.in_game and State.hud_enabled and not State.open)
+
+    local show_radio_display = State.in_game and InternetRadio:is_active()
+    local active_station = RADIO_STATIONS[State.station_index]
+    set_text(ui.radio_title, "RV RADIO  //  " .. active_station.name)
+    set_text(ui.radio_track, InternetRadio:now_playing_text(
+        active_station.now_playing or active_station.detail
+    ))
+    set_visibility(ui.radio_display, show_radio_display)
+    set_visibility(ui.radio_title, show_radio_display)
+    set_visibility(ui.radio_track, show_radio_display)
 end
 
 local select_station
@@ -635,15 +748,6 @@ local function apply_count()
     refresh_ui()
 end
 
-local function set_menu_widgets_visible(visible)
-    if not State.ui then
-        return
-    end
-    for _, widget in ipairs(State.ui.menu_widgets) do
-        set_visibility(widget, visible)
-    end
-end
-
 local function build_ui(player_controller)
     local classes = {
         user_widget = find_class("/Script/UMG.UserWidget"),
@@ -672,51 +776,81 @@ local function build_ui(player_controller)
         canvas = canvas,
         classes = classes,
         rows = {},
+        row_widgets = {},
         row_values = {},
         player_names = {},
         player_pings = {},
         player_statuses = {},
         station_options = {},
         menu_widgets = {},
+        game_widgets = {},
         references = { root, tree, canvas, widget_library },
     }
 
     local panel = create_border(tree, classes, COLORS.panel)
-    add_canvas_child(canvas, panel, -500, 24, 470, 570, 1)
+    ui.panel_slot = add_canvas_child(canvas, panel, -500, 24, 470, 450, 1)
     track(ui, panel, true)
 
     add_label(ui, "RV THERE NOW", -476, 43, 420, 31, COLORS.text, 21, true)
     ui.session_text = add_label(ui, "", -476, 77, 420, 24, COLORS.green, 13, true)
+    table.insert(ui.game_widgets, ui.session_text)
 
     add_row(ui, 1, 108, "PLAYER CAP")
-    add_row(ui, 2, 151, "COMPACT HUD")
-    add_row(ui, 3, 194, "")
-    add_row(ui, 4, 237, "RADIO STATION")
-    add_row(ui, 5, 280, "INTERNET RADIO")
+    add_row(ui, 2, 194, "COMPACT HUD")
+    add_row(ui, 3, 151, "")
+    add_row(ui, 4, 108, "RADIO STATION")
+    add_row(ui, 5, 151, "INTERNET RADIO")
 
-    ui.warning_text = add_label(ui, "Host-only setting", -476, 323, 420, 21, COLORS.muted, 12, true)
-    ui.status_text = add_label(ui, State.status, -476, 345, 420, 21, COLORS.muted, 12, true)
+    ui.warning_text = add_label(ui, "Host-only setting", -476, 194, 420, 21, COLORS.muted, 12, true)
+    ui.status_text = add_label(ui, State.status, -476, 216, 420, 21, COLORS.muted, 12, true)
+    table.insert(ui.game_widgets, ui.warning_text)
+    table.insert(ui.game_widgets, ui.status_text)
 
-    ui.player_page_text = add_label(ui, "PLAYERS", -476, 372, 420, 22, COLORS.green, 13, true)
-    add_left_label(ui, "NAME", -462, 396, 238, 20, COLORS.muted, 11, true)
-    add_label(ui, "PING", -220, 396, 76, 20, COLORS.muted, 11, true)
-    add_label(ui, "STATE", -140, 396, 78, 20, COLORS.muted, 11, true)
+    ui.player_page_text = add_label(ui, "PLAYERS", -476, 243, 420, 22, COLORS.green, 13, true)
+    table.insert(ui.game_widgets, ui.player_page_text)
+    local name_header = add_left_label(ui, "NAME", -462, 267, 238, 20, COLORS.muted, 11, true)
+    local ping_header = add_label(ui, "PING", -220, 267, 76, 20, COLORS.muted, 11, true)
+    local state_header = add_label(ui, "STATE", -140, 267, 78, 20, COLORS.muted, 11, true)
+    table.insert(ui.game_widgets, name_header)
+    table.insert(ui.game_widgets, ping_header)
+    table.insert(ui.game_widgets, state_header)
     for row = 1, PLAYER_ROWS do
-        local y = 418 + (row - 1) * 20
+        local y = 289 + (row - 1) * 20
         ui.player_names[row] = add_left_label(ui, "-", -462, y, 238, 19, COLORS.text, 12, true)
         ui.player_pings[row] = add_label(ui, "", -220, y, 76, 19, COLORS.muted, 11, true)
         ui.player_statuses[row] = add_label(ui, "", -140, y, 78, 19, COLORS.muted, 11, true)
+        table.insert(ui.game_widgets, ui.player_names[row])
+        table.insert(ui.game_widgets, ui.player_pings[row])
+        table.insert(ui.game_widgets, ui.player_statuses[row])
     end
 
     ui.station_dropdown = create_border(tree, classes, COLORS.surface_alt)
-    add_canvas_child(canvas, ui.station_dropdown, -426, 278, 370, 224, 8)
+    add_canvas_child(canvas, ui.station_dropdown, -426, 149, 370, 170, 8)
     track(ui, ui.station_dropdown, false)
     for index, station in ipairs(RADIO_STATIONS) do
-        local option = create_text(tree, classes, station.name, COLORS.text, 13, 0)
-        add_canvas_child(canvas, option, -412, 283 + (index - 1) * 27, 342, 24, 9)
+        local column = math.floor((index - 1) / 6)
+        local row = (index - 1) % 6
+        local option = create_text(tree, classes, station.name, COLORS.text, 11, 0)
+        add_canvas_child(canvas, option, -414 + column * 181, 154 + row * 27, 174, 24, 9)
         track(ui, option, false)
         ui.station_options[index] = option
     end
+
+    ui.radio_display = create_border(tree, classes, COLORS.panel)
+    ui.radio_display_slot = add_bottom_right_child(
+        canvas, ui.radio_display, -390, -84, 360, 54, 20
+    )
+    track(ui, ui.radio_display, false)
+    ui.radio_title = create_text(tree, classes, "RV RADIO", COLORS.green, 12, 2)
+    ui.radio_title_slot = add_bottom_right_child(
+        canvas, ui.radio_title, -380, -78, 340, 20, 21
+    )
+    track(ui, ui.radio_title, false)
+    ui.radio_track = create_text(tree, classes, "", COLORS.text, 11, 2)
+    ui.radio_track_slot = add_bottom_right_child(
+        canvas, ui.radio_track, -380, -55, 340, 19, 21
+    )
+    track(ui, ui.radio_track, false)
 
     ui.hud_border = create_border(tree, classes, COLORS.panel)
     add_canvas_child(canvas, ui.hud_border, -306, 24, 276, 42, 1)
@@ -776,7 +910,12 @@ local function move_selection(delta)
         refresh_ui()
         return
     end
-    State.selected_row = ((State.selected_row - 1 + delta) % MENU_ROWS) + 1
+    local rows = visible_menu_rows()
+    local current = 1
+    for index, row in ipairs(rows) do
+        if row == State.selected_row then current = index break end
+    end
+    State.selected_row = rows[((current - 1 + delta) % #rows) + 1]
     refresh_ui()
 end
 
@@ -897,6 +1036,9 @@ InternetRadio:set_url(RADIO_STATIONS[State.station_index].url)
 bind_key(Key.F6, toggle_menu, true)
 bind_key(Key.F7, function()
     if State.station_list_open then
+        return
+    end
+    if not State.in_game then
         return
     end
     InternetRadio:toggle()

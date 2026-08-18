@@ -77,6 +77,7 @@ function Radio.new(options)
         spatial_path = options.spatial_path,
         stop_path = options.stop_path,
         launch_path = options.launch_path,
+        now_playing_path = options.now_playing_path,
         is_valid = options.is_valid or default_is_valid,
         log = options.log or function() end,
         load_launcher = options.load_launcher or function(path)
@@ -109,6 +110,7 @@ function Radio.new(options)
         spatial_update_tick = 0,
         last_left_gain = nil,
         last_right_gain = nil,
+        now_playing = "",
     }
 
     if not self.url_path then
@@ -150,6 +152,12 @@ function Radio.new(options)
             "rv%-there%-now%-radio%.status$", "rv-there-now-radio.launch"
         )
         self.launch_path = replacements > 0 and derived or (self.status_path .. ".launch")
+    end
+    if not self.now_playing_path then
+        local derived, replacements = self.status_path:gsub(
+            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.nowplaying"
+        )
+        self.now_playing_path = replacements > 0 and derived or (self.status_path .. ".nowplaying")
     end
     if not self.bridge_available then
         self.bridge_available = function()
@@ -231,6 +239,7 @@ function Radio.new(options)
         os.remove(self.play_path)
         os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
+        os.remove(self.now_playing_path)
         local mode = is_youtube_url(self.url) and "youtube" or "stream"
         if not write_atomic(self.launch_path, mode) then
             return false, "Could not prepare hidden radio launcher"
@@ -373,9 +382,11 @@ function Radio.new(options)
         self.spatial_update_tick = 0
         self.last_left_gain = nil
         self.last_right_gain = nil
+        self.now_playing = ""
         os.remove(self.play_path)
         os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
+        os.remove(self.now_playing_path)
         os.remove(self.play_path .. ".part")
         os.remove(self.spatial_path .. ".part")
         self.sync_pending = false
@@ -562,7 +573,19 @@ function Radio.new(options)
         if not self:is_active() then
             return
         end
+        local source_ready = ensure_tape_player()
+        if not source_ready then
+            close_local("Left the RV session")
+            self.log("Internet radio stopped after leaving the RV session")
+            return
+        end
         self:maintain_audio()
+
+        local metadata = read_file(self.now_playing_path)
+        if metadata and metadata ~= "" then
+            metadata = metadata:gsub("[%c]", " "):gsub("%s+", " ")
+            self.now_playing = #metadata > 96 and (metadata:sub(1, 93) .. "...") or metadata
+        end
 
         if self.sync_pending and local_is_host() and self.sync
             and os.time() >= (self.next_sync_retry_at or 0) then
@@ -669,6 +692,11 @@ function Radio.new(options)
             return self.detail ~= "" and self.detail or "Internet radio is off"
         end
         return self.detail ~= "" and self.detail or self.state
+    end
+
+    function self:now_playing_text(fallback)
+        if self.now_playing ~= "" then return self.now_playing end
+        return tostring(fallback or self:source_name())
     end
 
     return self

@@ -1,7 +1,7 @@
 {
   "name": "RVThereNow",
   "author": "Rogue-Factor",
-  "version_number": "0.16.1",
+  "version_number": "0.17.0",
   "website_url": "https://github.com/Rogue-Factor/rv_there_now",
   "description": "An in-game session dashboard and expanded player cap for RV There Yet?",
   "dependencies": [

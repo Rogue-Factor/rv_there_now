@@ -29,10 +29,13 @@ for (const item of playlist) {
         continue;
     }
     const url = `${item.primary}${item.fn}.m4a`;
-    if (!url.startsWith("https://") || /[\r\n\t]/.test(url)) {
+    const artist = typeof item.track_artist === "string" ? item.track_artist : "";
+    const title = typeof item.title === "string" ? item.title : "";
+    const display = `${artist} - ${title}`.replace(/[\r\n\t]/g, " ").trim();
+    if (!url.startsWith("https://") || /[\r\n\t]/.test(url) || !display) {
         continue;
     }
-    output.puts(`${url}\n`);
+    output.puts(`${url}\t${display}\n`);
     count++;
 }
 output.close();
