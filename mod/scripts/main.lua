@@ -1,16 +1,11 @@
 local MOD_NAME = "RVThereNow"
-local MOD_VERSION = "0.17.0"
+local MOD_VERSION = "0.18.0"
 local MIN_PLAYERS = 4
 local MAX_PLAYERS = 24
 local PLAYER_ROWS = 8
 local MENU_ROWS = 5
 
 local RADIO_STATIONS = {
-    {
-        name = "SUMMER HITS '76",
-        detail = "AccuRadio 1976 hits",
-        url = "https://www.accuradio.com/channel/6a16080bab53e30b49bec67b",
-    },
     {
         name = "GROOVE SALAD",
         detail = "Ambient and downtempo",
@@ -47,28 +42,54 @@ local RADIO_STATIONS = {
         url = "https://ice5.somafm.com/defcon-128-mp3",
     },
     {
-        name = "KONA 610 AM",
-        detail = "News, talk, and Coast to Coast overnight",
-        now_playing = "Live news and talk / Coast to Coast overnight",
-        url = "https://live.amperwave.net/direct/townsquare-konaammp3-ibc3",
+        name = "THISTLE RADIO",
+        detail = "Celtic roots and branches",
+        url = "https://ice6.somafm.com/thistle-128-mp3",
     },
     {
-        name = "WNYC 93.9",
-        detail = "Public radio news and conversation",
-        now_playing = "Live public radio from New York",
-        url = "https://fm939.wnyc.org/wnycfm",
+        name = "VAPORWAVES",
+        detail = "Vaporwave around the clock",
+        url = "https://ice6.somafm.com/vaporwaves-128-mp3",
     },
     {
-        name = "RNZ NATIONAL",
-        detail = "News, interviews, readings, and features",
-        now_playing = "RNZ National live programming",
-        url = "http://radionz-ice.streamguys.com/national.mp3",
+        name = "THE IN-SOUND",
+        detail = "Sixties and seventies Euro pop",
+        url = "https://ice6.somafm.com/insound-128-mp3",
     },
     {
-        name = "BBC WORLD SERVICE",
-        detail = "Global news, documentaries, and discussion",
-        now_playing = "BBC World Service live programming",
-        url = "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service",
+        name = "DEEP SPACE ONE",
+        detail = "Deep ambient and space music",
+        url = "https://ice6.somafm.com/deepspaceone-128-mp3",
+    },
+    {
+        name = "METAL DETECTOR",
+        detail = "Metal from black to industrial",
+        url = "https://ice6.somafm.com/metal-128-mp3",
+    },
+    {
+        name = "FOLK FORWARD",
+        detail = "Indie, alternative, and classic folk",
+        url = "https://ice6.somafm.com/folkfwd-128-mp3",
+    },
+    {
+        name = "TIKI TIME",
+        detail = "Classic tiki and island rhythms",
+        url = "https://ice6.somafm.com/tikitime-128-mp3",
+    },
+    {
+        name = "7 INCH SOUL",
+        detail = "Vintage soul from original 45s",
+        url = "https://ice6.somafm.com/7soul-128-mp3",
+    },
+    {
+        name = "DUB STEP BEYOND",
+        detail = "Dubstep, dub, and deep bass",
+        url = "https://ice6.somafm.com/dubstep-128-mp3",
+    },
+    {
+        name = "BOOT LIQUOR",
+        detail = "Americana and roots music",
+        url = "https://ice6.somafm.com/bootliquor-128-mp3",
     },
 }
 
@@ -102,6 +123,8 @@ local State = {
     tape_hooks = {},
     tape_hooks_attempted = false,
     tape_controls = {},
+    tape_controls_ready = false,
+    world_address = nil,
 }
 
 local COLORS = {
@@ -343,12 +366,16 @@ local function update_runtime_cap(value)
 end
 
 local function update_session_snapshot()
-    local player_controller = State.player_controller
+    local player_controller = nil
+    pcall(function() player_controller = UEHelpers.GetPlayerController() end)
     if not is_valid(player_controller) then
+        State.in_game = false
+        State.session_role = "MENU"
         return
     end
+    State.player_controller = player_controller
 
-    local ok, players, role, roster, average_ping, in_game = pcall(function()
+    local ok, players, role, roster, average_ping, in_game, world_address = pcall(function()
         local player_states = {}
         local world = player_controller:GetWorld()
         if is_valid(world) and is_valid(world.GameState) and world.GameState.PlayerArray then
@@ -433,7 +460,8 @@ local function update_session_snapshot()
         end
 
         local average = ping_count > 0 and math.floor(ping_total / ping_count + 0.5) or nil
-        return #rows, is_host and "HOST" or "CLIENT", rows, average, gameplay
+        return #rows, is_host and "HOST" or "CLIENT", rows, average, gameplay,
+            unreal_address(world)
     end)
 
     if ok then
@@ -442,6 +470,11 @@ local function update_session_snapshot()
         State.players = roster
         State.average_ping = average_ping
         State.in_game = in_game == true
+        if State.world_address ~= world_address then
+            State.world_address = world_address
+            State.tape_controls = {}
+            State.tape_controls_ready = false
+        end
         if not State.in_game then
             State.session_role = "MENU"
         end
@@ -496,28 +529,44 @@ local function row_color(index)
     return COLORS.surface_alt
 end
 
-local function refresh_ui()
+local function refresh_hud()
     local ui = State.ui
-    if not ui or not is_valid(ui.root) then
-        return
-    end
-
-    update_session_snapshot()
-    normalize_menu_selection()
-    set_menu_widgets_visible(State.open)
-    local previous_radio_state = InternetRadio.state
-    InternetRadio:update()
+    if not ui or not is_valid(ui.root) then return end
     for index, station in ipairs(RADIO_STATIONS) do
         if station.url == InternetRadio.url then
             State.station_index = index
             break
         end
     end
-    if State.selected_row == 5 and InternetRadio:is_active() then
-        State.status = InternetRadio:status_text()
+    local ping_summary = State.average_ping
+        and string.format("AVG %d ms", State.average_ping) or "PING --"
+    set_text(ui.hud_text, string.format(
+        "RV NOW   %d / %d   %s", State.session_players, State.applied_count, ping_summary
+    ))
+    set_visibility(ui.hud_border, State.in_game and State.hud_enabled and not State.open)
+    set_visibility(ui.hud_text, State.in_game and State.hud_enabled and not State.open)
+
+    local show_radio_display = State.in_game and InternetRadio:is_active()
+    local active_station = RADIO_STATIONS[State.station_index]
+    set_text(ui.radio_title, "RV RADIO  //  " .. active_station.name)
+    set_text(ui.radio_track, InternetRadio:now_playing_text(
+        active_station.now_playing or active_station.detail
+    ))
+    set_visibility(ui.radio_display, show_radio_display)
+    set_visibility(ui.radio_title, show_radio_display)
+    set_visibility(ui.radio_track, show_radio_display)
+end
+
+local function refresh_ui()
+    local ui = State.ui
+    if not ui or not is_valid(ui.root) then
+        return
     end
-    if previous_radio_state ~= InternetRadio.state
-        and (previous_radio_state == "OPENING" or InternetRadio.state == "FAILED") then
+
+    normalize_menu_selection()
+    set_menu_widgets_visible(State.open)
+    refresh_hud()
+    if State.selected_row == 5 and InternetRadio:is_active() then
         State.status = InternetRadio:status_text()
     end
     set_text(ui.session_text, string.format("SESSION  %d / %d   %s", State.session_players, State.applied_count, State.session_role))
@@ -559,9 +608,6 @@ local function refresh_ui()
         set_text_color(ui.warning_text, COLORS.muted)
     end
 
-    local ping_summary = State.average_ping and string.format("AVG %d ms", State.average_ping) or "PING --"
-    set_text(ui.hud_text, string.format("RV NOW   %d / %d   %s", State.session_players, State.applied_count, ping_summary))
-
     local page_count = math.max(1, math.ceil(#State.players / PLAYER_ROWS))
     State.player_page = math.max(1, math.min(page_count, State.player_page))
     set_text(ui.player_page_text, string.format("PLAYERS  %d / %d   PAGE %d / %d", State.session_players, State.applied_count, State.player_page, page_count))
@@ -588,25 +634,14 @@ local function refresh_ui()
             set_text(ui.player_statuses[row], "")
         end
     end
-    set_visibility(ui.hud_border, State.in_game and State.hud_enabled and not State.open)
-    set_visibility(ui.hud_text, State.in_game and State.hud_enabled and not State.open)
-
-    local show_radio_display = State.in_game and InternetRadio:is_active()
-    local active_station = RADIO_STATIONS[State.station_index]
-    set_text(ui.radio_title, "RV RADIO  //  " .. active_station.name)
-    set_text(ui.radio_track, InternetRadio:now_playing_text(
-        active_station.now_playing or active_station.detail
-    ))
-    set_visibility(ui.radio_display, show_radio_display)
-    set_visibility(ui.radio_title, show_radio_display)
-    set_visibility(ui.radio_track, show_radio_display)
 end
 
 local select_station
 
 local function discover_tape_players()
     local ok, tape_players = pcall(FindAllOf, "BP_TapePlayer_C")
-    if not ok or not tape_players then return end
+    if not ok or not tape_players then return false end
+    local found = false
     for _, tape_player in ipairs(tape_players) do
         local address = is_valid(tape_player) and unreal_address(tape_player) or nil
         local existing = address and State.tape_controls[address] or nil
@@ -638,18 +673,19 @@ local function discover_tape_players()
                 end)
                 controls.tape_player = tape_player
                 State.tape_controls[address] = controls
+                found = true
                 log("Physical RV buttons bound to internet-radio controls")
             end
         end
     end
+    return found
 end
 
 local function register_tape_control_hooks()
+    if State.tape_hooks_attempted then return true end
     pcall(function()
         LoadAsset("/Game/Ride/Vehicle/Blueprints/BP_TapePlayer")
     end)
-    discover_tape_players()
-    if State.tape_hooks_attempted then return end
     State.tape_hooks_attempted = true
 
     local class_path = "/Game/Ride/Vehicle/Blueprints/BP_TapePlayer.BP_TapePlayer_C:"
@@ -721,8 +757,10 @@ local function register_tape_control_hooks()
             post = post_id,
         })
         log("Registered physical RV internet-radio controls")
+        return true
     else
         State.tape_hooks_attempted = false
+        return false
     end
 end
 
@@ -825,11 +863,11 @@ local function build_ui(player_controller)
     end
 
     ui.station_dropdown = create_border(tree, classes, COLORS.surface_alt)
-    add_canvas_child(canvas, ui.station_dropdown, -426, 149, 370, 170, 8)
+    add_canvas_child(canvas, ui.station_dropdown, -426, 149, 370, 250, 8)
     track(ui, ui.station_dropdown, false)
     for index, station in ipairs(RADIO_STATIONS) do
-        local column = math.floor((index - 1) / 6)
-        local row = (index - 1) % 6
+        local column = math.floor((index - 1) / 9)
+        local row = (index - 1) % 9
         local option = create_text(tree, classes, station.name, COLORS.text, 11, 0)
         add_canvas_child(canvas, option, -414 + column * 181, 154 + row * 27, 174, 24, 9)
         track(ui, option, false)
@@ -875,6 +913,7 @@ local function set_menu_open(should_open)
     end
 
     State.player_controller = player_controller
+    update_session_snapshot()
     if not State.ui or not is_valid(State.ui.root) then
         State.ui = nil
         build_ui(player_controller)
@@ -1083,24 +1122,30 @@ bind_key(Key.PAGE_DOWN, function()
 end)
 
 pcall(function()
-    LoopInGameThreadWithDelay(1000, function()
-        InternetRadio:poll_sync()
-        if State.ui and is_valid(State.ui.root) then
-            refresh_ui()
-        elseif InternetRadio:is_active() then
+    local scheduler_tick = 0
+    LoopInGameThreadWithDelay(100, function()
+        scheduler_tick = (scheduler_tick + 1) % 10
+        if InternetRadio.state == "PREPARING" or InternetRadio.state == "OPENING" then
             InternetRadio:update()
         end
-    end)
-end)
-
-pcall(function()
-    LoopInGameThreadWithDelay(25, function()
         InternetRadio:maintain_audio()
-    end)
-end)
 
-pcall(function()
-    LoopInGameThreadWithDelay(1000, register_tape_control_hooks)
+        if scheduler_tick % 5 == 0 and State.in_game then
+            InternetRadio:poll_sync()
+        end
+
+        if scheduler_tick == 0 then
+            update_session_snapshot()
+            if InternetRadio.state == "PLAYING" then InternetRadio:update() end
+            if not State.tape_hooks_attempted then register_tape_control_hooks() end
+            if State.in_game and not State.tape_controls_ready then
+                State.tape_controls_ready = discover_tape_players()
+            end
+            if State.ui and is_valid(State.ui.root) then
+                if State.open then refresh_ui() else refresh_hud() end
+            end
+        end
+    end)
 end)
 
 log(string.format("v%s loaded; F6 opens the menu and F7 toggles the radio test", MOD_VERSION))

@@ -101,29 +101,26 @@ fi
 if grep -Fq 'set_text(ui.row_values[4], "RESET")' "$ROOT/mod/scripts/main.lua"; then
   fail 'Reset row remains in dashboard'
 fi
-grep -Fq 'local SYNC_LEAD_SECONDS = 12' "$ROOT/mod/scripts/radio.lua" \
-    || fail 'radio must use the shortened synchronized startup lead'
-grep -Fq '#define STREAM_READY_CHUNKS 1' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'radio bridge must become ready after its first stream chunk'
-grep -Fq '#define STREAM_CHUNK_SECONDS 1' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'radio bridge must use one-second startup chunks'
-grep -Fq '#define STREAM_RETAIN_CHUNKS 3' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'radio bridge must retain its recovery window'
+grep -Fq 'local SYNC_LEAD_SECONDS = 4' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'radio must use the four-second synchronized startup lead'
+grep -Fq '#define STREAM_BUFFER_SECONDS 8' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge must retain an eight-second in-memory recovery buffer'
+grep -Fq '#define STREAM_READY_SECONDS 2' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge must prebuffer two seconds before synchronized playback'
 grep -Fq '#define STREAM_CHANNELS 1' "$ROOT/bridge/rv_radio_bridge.c" \
     || fail 'native stream must use the cassette mono source contract'
-grep -Fq 'native_chunk_player_init' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'native chunk output is missing from the bundled bridge'
+grep -Fq 'ma_pcm_rb_init' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'native in-memory stream buffer is missing from the bundled bridge'
 grep -Fq 'spatial_audio_mono_to_stereo_s16' "$ROOT/bridge/rv_radio_bridge.c" \
     || fail 'native output must apply RV-relative stereo gains'
-grep -Fq 'write_atomic(self.play_path' "$ROOT/mod/scripts/radio.lua" \
-    || fail 'Lua must release the synchronized native playback gate'
-grep -Fq 'fscanf(file, "%u", &value)' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'native playback gate must parse Lua ASCII control data'
-if grep -Fq 'fwscanf(file' "$ROOT/bridge/rv_radio_bridge.c"; then
-  fail 'wide scanning cannot parse the Lua ASCII playback gate reliably under Wine'
+grep -Fq 'call_bridge("rvtn_play")' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'Lua must release synchronized playback through the native bridge'
+grep -Fq '__declspec(dllexport) int __cdecl rvtn_play' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'native playback signal export is missing'
+if grep -Eq 'write_pcm_chunk|pcm_chunk_exists|\.pcm"|_wfopen\(g_play_path' \
+    "$ROOT/bridge/rv_radio_bridge.c"; then
+  fail 'legacy disk-backed PCM handoff remains'
 fi
-grep -Fq 'rv-there-now-radio.playing' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'native output confirmation marker is missing'
 if grep -Fq 'SIK_QueueAudio' "$ROOT/mod/scripts/radio.lua"; then
   fail 'dead Unreal procedural playback path remains'
 fi
@@ -145,12 +142,14 @@ grep -Fq 'same_unreal_object(character, local_character)' "$ROOT/mod/scripts/mai
 if grep -Eq 'os\.execute|start ""' "$ROOT/mod/scripts/radio.lua"; then
   fail 'radio helper still launches through a focus-stealing command shell'
 fi
-grep -Fq 'package.loadlib(path, "rvtn_launch")' "$ROOT/mod/scripts/radio.lua" \
-    || fail 'radio helper does not use the in-process native launcher'
-grep -Fq 'CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP' "$ROOT/bridge/rv_radio_launcher.c" \
-    || fail 'radio bridge child process is not launched hidden'
-grep -Fq 'read_launch_mode' "$ROOT/bridge/rv_radio_bridge.c" \
-    || fail 'radio bridge cannot consume the no-argument Unreal launch request'
+grep -Fq 'package.loadlib(path, symbol)' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'radio does not load the native bridge DLL'
+grep -Fq 'FreeLibraryAndExitThread' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge worker does not retain its DLL lifetime'
+grep -Fq 'Previous radio worker did not stop' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'radio bridge does not serialize worker restarts'
+grep -Fq '__declspec(dllexport) int __cdecl rvtn_stop' "$ROOT/bridge/rv_radio_bridge.c" \
+    || fail 'native stop signal export is missing'
 grep -Fq 'Left the RV session' "$ROOT/mod/scripts/radio.lua" \
     || fail 'radio does not stop when its RV world is unloaded'
 grep -Fq 'Icy-MetaData: 1' "$ROOT/bridge/rv_radio_bridge.c" \
@@ -163,26 +162,39 @@ if grep -Fq 'ProjectWorldLocationToScreen' "$ROOT/mod/scripts/main.lua"; then
   fail 'now-playing display still follows the physical radio'
 fi
 
-[[ -f "$ROOT/mod/bin/rv-radio-bridge.exe" ]] || fail 'bundled radio bridge is missing'
-[[ -f "$ROOT/mod/bin/rv-radio-launcher.dll" ]] || fail 'bundled hidden launcher is missing'
-[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/rv-radio-launcher.dll" | tr -d ' ')" == '4d5a' ]] \
-    || fail 'bundled hidden launcher is not a Windows DLL'
-[[ -f "$ROOT/mod/bin/accuradio-resolver.js" ]] || fail 'bundled AccuRadio resolver is missing'
-grep -Fq 'JSON.parse' "$ROOT/mod/bin/accuradio-resolver.js" \
-    || fail 'AccuRadio resolver must use structured JSON parsing'
-[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/rv-radio-bridge.exe" | tr -d ' ')" == '4d5a' ]] \
-    || fail 'bundled radio bridge is not a Windows executable'
-[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/yt-dlp.exe" | tr -d ' ')" == '4d5a' ]] \
-    || fail 'bundled YouTube resolver is not a Windows executable'
-[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/qjs.exe" | tr -d ' ')" == '4d5a' ]] \
-    || fail 'bundled QuickJS runtime is not a Windows executable'
-(cd "$ROOT" && sha256sum -c bridge/dependencies.sha256 >/dev/null) \
-    || fail 'bundled YouTube dependency checksum failed'
+[[ -f "$ROOT/mod/bin/rv-radio-bridge.dll" ]] || fail 'bundled radio bridge DLL is missing'
+[[ ! -f "$ROOT/mod/bin/rv-radio-bridge.exe" ]] || fail 'obsolete radio bridge executable remains'
+[[ ! -f "$ROOT/mod/bin/rv-radio-launcher.dll" ]] || fail 'obsolete launcher DLL remains'
+[[ "$(od -An -tx1 -N2 "$ROOT/mod/bin/rv-radio-bridge.dll" | tr -d ' ')" == '4d5a' ]] \
+    || fail 'bundled radio bridge is not a Windows DLL'
 [[ -f "$ROOT/mod/licenses/LICENSE.miniaudio" ]] || fail 'miniaudio license is missing'
-[[ -f "$ROOT/mod/licenses/LICENSE.yt-dlp" ]] || fail 'yt-dlp license is missing'
-[[ -f "$ROOT/mod/licenses/THIRD_PARTY_LICENSES.yt-dlp.txt" ]] \
-    || fail 'yt-dlp third-party licenses are missing'
-[[ -f "$ROOT/mod/licenses/LICENSE.quickjs-ng" ]] || fail 'QuickJS license is missing'
+if find "$ROOT/mod/bin" -maxdepth 1 -type f ! -name 'rv-radio-bridge.dll' -print -quit | grep -q .; then
+  fail 'unsupported executable or resolver remains in the radio package'
+fi
+if rg -i 'accuradio|youtube|yt-dlp|quickjs|qjs' "$ROOT/mod" "$ROOT/bridge"; then
+  fail 'unsupported radio provider or resolver code remains'
+fi
+[[ "$(grep -Ec 'ice[0-9]+\.somafm\.com/' "$ROOT/mod/scripts/main.lua")" == '17' ]] \
+    || fail 'station catalog must contain exactly seventeen SomaFM direct streams'
+[[ "$(grep -Fc 'u80s-128-mp3' "$ROOT/mod/scripts/main.lua")" == '1' ]] \
+    || fail 'Underground 80s must appear exactly once'
+if rg -i 'KONA|WNYC|RNZ NATIONAL|BBC WORLD' "$ROOT/mod/scripts/main.lua"; then
+  fail 'news or talk station remains in the bundled catalog'
+fi
+[[ "$(grep -Fc 'LoopInGameThreadWithDelay(' "$ROOT/mod/scripts/main.lua")" == '1' ]] \
+    || fail 'game-thread maintenance must use one consolidated scheduler'
+grep -Fq 'scheduler_tick % 5 == 0' "$ROOT/mod/scripts/main.lua" \
+    || fail 'Steam radio synchronization must poll at 500 ms intervals'
+grep -Fq 'InternetRadio.state == "PREPARING" or InternetRadio.state == "OPENING"' \
+    "$ROOT/mod/scripts/main.lua" \
+    || fail 'fast radio updates must stop after startup'
+grep -Fq 'self.next_presence_poll_at = now + 1' "$ROOT/mod/scripts/lobby_sync.lua" \
+    || fail 'rich-presence fallback polling must be rate limited'
+if grep -Fq 'LoopInGameThreadWithDelay(25, function()' "$ROOT/mod/scripts/main.lua"; then
+  fail 'legacy 40 Hz spatial maintenance loop remains'
+fi
+grep -Fq 'host:match("^ice%d+%.somafm%.com$")' "$ROOT/mod/scripts/radio.lua" \
+    || fail 'radio playback must reject non-SomaFM lobby sources'
 [[ -f "$ROOT/LICENSE" ]] || fail 'project GPL license is missing'
 [[ -f "$ROOT/standalone/UE4SS-settings.ini" ]] || fail 'standalone UE4SS settings are missing'
 grep -Fq 'MajorVersion = 5' "$ROOT/standalone/UE4SS-settings.ini" \

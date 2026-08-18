@@ -11,6 +11,7 @@ static volatile LONG g_left_gain = SPATIAL_SCALE;
 static volatile LONG g_right_gain = SPATIAL_SCALE;
 static float g_current_left = 1.0f;
 static float g_current_right = 1.0f;
+static FILETIME g_last_spatial_write;
 
 static LONG clamp_gain(double gain)
 {
@@ -30,17 +31,23 @@ void spatial_audio_initialize(void)
             L"%lsrv-there-now-radio.spatial", temp_path);
         g_spatial_path[MAX_PATH - 1] = L'\0';
     }
+    memset(&g_last_spatial_write, 0, sizeof(g_last_spatial_write));
 }
 
 void spatial_audio_update(void)
 {
-    FILE* file = _wfopen(g_spatial_path, L"rb");
+    WIN32_FILE_ATTRIBUTE_DATA attributes;
+    FILE* file;
     double left;
     double right;
+    if (!GetFileAttributesExW(g_spatial_path, GetFileExInfoStandard, &attributes)) return;
+    if (CompareFileTime(&attributes.ftLastWriteTime, &g_last_spatial_write) == 0) return;
+    file = _wfopen(g_spatial_path, L"rb");
     if (file == NULL) return;
     if (fscanf(file, "%lf %lf", &left, &right) == 2) {
         InterlockedExchange(&g_left_gain, clamp_gain(left));
         InterlockedExchange(&g_right_gain, clamp_gain(right));
+        g_last_spatial_write = attributes.ftLastWriteTime;
     }
     fclose(file);
 }

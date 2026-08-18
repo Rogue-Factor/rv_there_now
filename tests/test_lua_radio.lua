@@ -72,70 +72,61 @@ local launches = {}
 local messages = {}
 local url_path = os.tmpname() .. ".url"
 local status_path = os.tmpname() .. ".status"
-local youtube_path = os.tmpname() .. ".m4a"
-local stop_path = os.tmpname() .. ".stop"
-local launch_path = os.tmpname() .. ".launch"
-local function recording_launcher(path)
+local function recording_bridge(_, symbol)
     return function()
-        local file = assert(io.open(path, "rb"))
-        table.insert(launches, file:read("*all"))
-        file:close()
-        os.remove(path)
+        table.insert(launches, symbol)
     end
 end
-local function noop_loader()
+local function noop_bridge_loader()
     return function() end
 end
 local radio = Radio.new({
-    bridge_path = "C:\\Mods\\RVThereNow\\bin\\rv-radio-bridge.exe",
+    bridge_path = "C:\\Mods\\RVThereNow\\bin\\rv-radio-bridge.dll",
     status_path = status_path,
     url_path = url_path,
-    youtube_path = youtube_path,
-    stop_path = stop_path,
-    launch_path = launch_path,
     get_player_controller = function() return controller end,
     get_server_time = function() return 100 end,
     bridge_available = function() return true end,
     read_status = function() return nil end,
-    load_launcher = function() return recording_launcher(launch_path) end,
+    load_bridge = recording_bridge,
     sync = sync,
     log = function(message) table.insert(messages, message) end,
 })
 
-assert(radio:set_url("https://example.com/live.mp3?token=a&mode=1"))
-assert(radio:source_name() == "example.com")
-assert(radio:set_url("https://www.youtube.com/watch?v=test"))
-local combined_ok, combined_error = radio:set_url("https://example.comhttps://youtu.be/test")
+assert(radio:set_url("https://ice5.somafm.com/groovesalad-128-mp3"))
+assert(radio:source_name() == "ice5.somafm.com")
+local unsupported_ok, unsupported_error = radio:set_url("https://example.com/live.mp3")
+assert(not unsupported_ok)
+assert(unsupported_error == "Source is not a supported SomaFM stream")
+local combined_ok, combined_error = radio:set_url(
+    "https://ice5.somafm.comhttps://other.example/live.mp3"
+)
 assert(not combined_ok)
 assert(combined_error == "URL contains another address")
 
-assert(radio:set_url("https://youtu.be/test"))
 assert(radio:start())
 assert(radio.state == "PREPARING")
-assert(radio.backend == "youtube")
-assert(radio.target_time == 112)
-assert(#published == 1 and published[1].url == "https://youtu.be/test")
+assert(radio.backend == "stream")
+assert(radio.target_time == 104)
+assert(#published == 1 and published[1].url == "https://ice5.somafm.com/groovesalad-128-mp3")
 assert(audio.stopped)
-assert(#launches == 1 and launches[1] == "youtube")
+assert(#launches == 1 and launches[1] == "rvtn_launch")
 local url_file = assert(io.open(url_path, "rb"))
-assert(url_file:read("*all") == "https://youtu.be/test")
+assert(url_file:read("*all") == "https://ice5.somafm.com/groovesalad-128-mp3")
 url_file:close()
 
 radio:stop("Stopped at RV radio")
 assert(radio.state == "OFF")
 assert(radio.detail == "Stopped at RV radio")
 assert(#published == 2 and published[2].state == "stop")
-assert(#launches == 1)
-local stop_file = assert(io.open(stop_path, "rb"))
-assert(stop_file:read("*all") == "stop")
-stop_file:close()
+assert(#launches == 2 and launches[2] == "rvtn_stop")
 
 local restart_launch_count = #launches
 assert(radio:start())
 assert(radio.state == "PREPARING")
 assert(#published == 3 and published[3].state == "play")
 assert(#launches == restart_launch_count + 1)
-assert(launches[#launches] == "youtube")
+assert(launches[#launches] == "rvtn_launch")
 assert(radio:adjust_volume(0.2) == 0.7)
 assert(published[#published].state == "volume")
 assert(published[#published].volume == 0.7)
@@ -145,8 +136,7 @@ local failed = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,
     bridge_available = function() return false end,
-    load_launcher = noop_loader,
-    stop_path = os.tmpname() .. ".stop",
+    load_bridge = noop_bridge_loader,
 })
 assert(not failed:start())
 assert(failed.state == "FAILED")
@@ -156,8 +146,7 @@ local unsynchronized = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,
     bridge_available = function() return true end,
-    load_launcher = noop_loader,
-    stop_path = os.tmpname() .. ".stop",
+    load_bridge = noop_bridge_loader,
     get_player_count = function() return 2 end,
     sync = {
         publish_start = function()
@@ -169,28 +158,23 @@ assert(not unsynchronized:start())
 assert(unsynchronized.state == "UNAVAILABLE")
 assert(unsynchronized.detail == "Steam lobby metadata unavailable")
 
-local client_stop_path = os.tmpname() .. ".stop"
 local client_radio = Radio.new({
     get_player_controller = function() return controller end,
     is_host = false,
-    stop_path = client_stop_path,
     sync = sync,
 })
 client_radio.state = "PLAYING"
 assert(not client_radio:stop())
 assert(client_radio.state == "PLAYING")
 assert(client_radio.detail == "Only the host can stop the RV radio")
-assert(io.open(client_stop_path, "rb") == nil)
 
 local solo_unsynchronized = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,
     status_path = status_path,
     url_path = url_path,
-    youtube_path = youtube_path,
-    stop_path = stop_path,
     bridge_available = function() return true end,
-    load_launcher = noop_loader,
+    load_bridge = noop_bridge_loader,
     get_server_time = function() return 100 end,
     get_player_count = function() return 1 end,
     sync = {
@@ -205,10 +189,8 @@ assert(solo_unsynchronized.sync_pending)
 assert(solo_unsynchronized.detail == "Local RV audio; waiting for Steam session")
 
 local media_now = 200
-local media_prefix = os.tmpname() .. "-youtube-stream"
-local media_play_path = os.tmpname() .. ".play"
-local media_confirmed_path = os.tmpname() .. ".playing"
 local media_spatial_path = os.tmpname() .. ".spatial"
+local media_status = "STREAM_READY 44100\t1"
 local media_sync = {}
 function media_sync:publish_start(url, target_time)
     return { state = "play", url = url, target_time = target_time, serial = "media-1" }
@@ -220,53 +202,34 @@ local file_radio = Radio.new({
     is_host = true,
     status_path = status_path,
     url_path = url_path,
-    youtube_path = youtube_path,
-    play_path = media_play_path,
-    confirmed_path = media_confirmed_path,
     spatial_path = media_spatial_path,
     bridge_available = function() return true end,
-    load_launcher = noop_loader,
+    load_bridge = noop_bridge_loader,
     get_server_time = function() return media_now end,
     read_status = function()
-        return string.format("STREAM_PCM %s\t44100\t1\t1", media_prefix)
+        return media_status
     end,
     sync = media_sync,
 })
-assert(file_radio:set_url("https://youtu.be/media-test"))
+assert(file_radio:set_url("https://ice6.somafm.com/deepspaceone-128-mp3"))
 assert(file_radio:start())
-media_now = 212
+media_now = 204
 file_radio:update()
 file_radio:update()
 assert(file_radio.state == "OPENING")
 assert(file_radio.native_play_started)
-local media_play = assert(io.open(media_play_path, "rb"))
-assert(media_play:read("*all") == "0")
-media_play:close()
 local media_spatial = assert(io.open(media_spatial_path, "rb"))
 assert(media_spatial:read("*all") == "0.5000 0.5000")
 media_spatial:close()
-local media_confirmed = assert(io.open(media_confirmed_path, "wb"))
-media_confirmed:close()
+media_status = "PLAYING"
 file_radio:update()
 assert(file_radio.state == "PLAYING")
 file_radio:stop()
-assert(not io.open(media_play_path, "rb"))
-assert(not io.open(media_confirmed_path, "rb"))
 
-local stream_prefix = os.tmpname() .. "-stream"
-local stream_play_path = os.tmpname() .. ".play"
-local stream_confirmed_path = os.tmpname() .. ".playing"
 local stream_spatial_path = os.tmpname() .. ".spatial"
 local stream_now_playing_path = os.tmpname() .. ".nowplaying"
-local function write_chunk(sequence)
-    local path = string.format("%s.%06d.pcm", stream_prefix, sequence)
-    local file = assert(io.open(path, "wb"))
-    file:write("pcm")
-    file:close()
-end
-write_chunk(0)
-write_chunk(1)
 local stream_now = 300
+local stream_status = "STREAM_READY 48000\t1"
 local stream_sync = {}
 function stream_sync:publish_start(url, target_time)
     return { state = "play", url = url, target_time = target_time, serial = "stream-1" }
@@ -278,40 +241,32 @@ local stream_radio = Radio.new({
     is_host = true,
     status_path = status_path,
     url_path = url_path,
-    youtube_path = youtube_path,
-    play_path = stream_play_path,
-    confirmed_path = stream_confirmed_path,
     spatial_path = stream_spatial_path,
     now_playing_path = stream_now_playing_path,
     bridge_available = function() return true end,
-    launch_path = launch_path,
-    load_launcher = function() return recording_launcher(launch_path) end,
+    load_bridge = recording_bridge,
     get_server_time = function() return stream_now end,
     read_status = function()
-        return string.format("STREAM_PCM %s\t48000\t1\t1", stream_prefix)
+        return stream_status
     end,
     sync = stream_sync,
 })
-assert(stream_radio:set_url("https://example.com/live.mp3"))
+assert(stream_radio:set_url("https://ice6.somafm.com/thistle-128-mp3"))
 assert(stream_radio:start())
-assert(launches[#launches] == "stream")
-stream_now = 305
+assert(launches[#launches] == "rvtn_launch")
+stream_now = 303
 stream_radio:update()
 assert(stream_radio.state == "PREPARING")
-assert(stream_radio.detail == "Live stream buffered; starting in 7s")
-stream_now = 312
+assert(stream_radio.detail == "Live stream buffered; starting in 1s")
+stream_now = 304
 stream_radio:update()
 assert(stream_radio.state == "OPENING")
-assert(stream_radio.stream_sequence == 0)
 local first_play_count = audio.play_count
-local stream_play = assert(io.open(stream_play_path, "rb"))
-assert(stream_play:read("*all") == "0")
-stream_play:close()
+assert(launches[#launches] == "rvtn_play")
 local stream_spatial = assert(io.open(stream_spatial_path, "rb"))
 assert(stream_spatial:read("*all") == "0.5000 0.5000")
 stream_spatial:close()
-local stream_confirmed = assert(io.open(stream_confirmed_path, "wb"))
-stream_confirmed:close()
+stream_status = "PLAYING"
 stream_now = 313
 stream_radio:maintain_audio()
 assert(audio.play_count == first_play_count)
@@ -324,23 +279,15 @@ stream_radio:update()
 assert(stream_radio:now_playing_text("fallback") == "Test Artist - Test Track")
 stream_now = 319.97
 stream_radio:maintain_audio()
-assert(stream_radio.stream_sequence == 0)
 assert(stream_radio.native_play_started)
 tape_player.valid = false
 stream_radio:update()
 assert(stream_radio.state == "OFF", stream_radio.state .. ": " .. stream_radio.detail)
 assert(stream_radio.detail == "Left the RV session")
-assert(not io.open(stream_play_path, "rb"))
-assert(not io.open(stream_confirmed_path, "rb"))
 assert(not io.open(stream_now_playing_path, "rb"))
 
 os.remove(url_path)
 os.remove(status_path)
-os.remove(youtube_path)
-os.remove(stop_path)
-os.remove(launch_path)
 os.remove(media_spatial_path)
 os.remove(stream_spatial_path)
-os.remove(string.format("%s.%06d.pcm", stream_prefix, 0))
-os.remove(string.format("%s.%06d.pcm", stream_prefix, 1))
 print("Lua radio tests passed.")

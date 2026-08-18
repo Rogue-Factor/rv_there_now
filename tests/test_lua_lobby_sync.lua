@@ -17,6 +17,12 @@ end
 function matchmaking:GetLobbyData(_, key)
     return store[key] or ""
 end
+local primary_presence_reads = 0
+local quiet_friends = {}
+function quiet_friends:GetFriendRichPresence()
+    primary_presence_reads = primary_presence_reads + 1
+    return ""
+end
 
 local host = LobbySync.new({
     context = function() return {} end,
@@ -27,18 +33,22 @@ local client = LobbySync.new({
     context = function() return {} end,
     sessions = sessions,
     matchmaking = matchmaking,
+    friends = quiet_friends,
+    host_id = { Result = 76561198000000001 },
 })
 
-local published = assert(host:publish_start("https://youtu.be/test", 42.5, 0.7))
+local published = assert(host:publish_start("https://ice5.somafm.com/groovesalad-128-mp3", 42.5, 0.7))
 assert(published.state == "play")
-assert(writes[#writes] == "rvtn_radio_serial")
+assert(#writes == 1 and writes[1] == "rvtn_radio_event")
 local received = assert(client:poll())
-assert(received.url == "https://youtu.be/test")
+assert(received.url == "https://ice5.somafm.com/groovesalad-128-mp3")
 assert(received.target_time == 42.5)
 assert(received.volume == 0.7)
 assert(client:poll() == nil)
+assert(primary_presence_reads == 0)
 
 assert(host:publish_volume(0.4))
+assert(writes[#writes] == "rvtn_radio_volume_event")
 local volume = assert(client:poll())
 assert(volume.state == "volume" and volume.volume == 0.4)
 local late_client = LobbySync.new({
@@ -50,7 +60,7 @@ local late_play = assert(late_client:poll())
 assert(late_play.state == "play" and late_play.volume == 0.4)
 
 assert(host:publish_stop())
-assert(writes[#writes] == "rvtn_radio_serial")
+assert(writes[#writes] == "rvtn_radio_event")
 local stopped = assert(client:poll())
 assert(stopped.state == "stop")
 

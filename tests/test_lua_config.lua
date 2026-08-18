@@ -62,7 +62,7 @@ assert(ConfigStore.read_radio_url(radio_path) == nil)
 assert(ConfigStore.set_radio_url(radio_path, "https://example.com/live.mp3?token=a&mode=1"))
 assert(ConfigStore.read_radio_url(radio_path) == "https://example.com/live.mp3?token=a&mode=1")
 assert(not ConfigStore.set_radio_url(radio_path, "file:///tmp/audio.mp3"))
-assert(not ConfigStore.set_radio_url(radio_path, "https://example.comhttps://youtu.be/video"))
+assert(not ConfigStore.set_radio_url(radio_path, "https://example.comhttps://other.example/live.mp3"))
 write("https://example.comhttps://youtu.be/video\n")
 assert(ConfigStore.read_radio_url(path) == nil)
 

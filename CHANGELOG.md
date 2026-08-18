@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.18.0
+
+- Replace one-second PCM files with an eight-second in-memory ring buffer so the audio callback performs no disk I/O.
+- Replace play and stop control files with direct DLL signals and move spatial-file reads off the real-time audio callback.
+- Consolidate five UE4SS timers into one scheduler, stop repeated tape-player scans after binding a world, and skip hidden menu redraws.
+- Use Steam rich presence only when lobby metadata is unavailable instead of duplicating every lobby operation.
+- Replace the separate launcher and radio executable with one in-process radio bridge DLL.
+- Reduce the synchronized radio start lead from twelve seconds to four seconds.
+- Remove news and talk stations from the bundled catalog.
+- Remove the AccuRadio and YouTube resolver paths, QuickJS, and yt-dlp; the radio now uses only published continuous SomaFM MP3 streams.
+- Expand the SomaFM catalog to 17 music stations.
+- Poll Steam radio state every 500 ms and release buffered audio every 100 ms while keeping dashboard refresh work on its one-second loop.
+- Publish start, stop, and volume changes as atomic Steam lobby events instead of multi-key updates.
+- Reject arbitrary lobby-injected URLs at playback and allow only HTTPS SomaFM MP3 endpoints.
+- Add a prominent SomaFM acknowledgment and donation link to the project and standalone instructions.
+- Rate-limit rich-presence fallback checks to remove game-thread stutter introduced by overly aggressive Steam polling.
+- Restrict 100 ms status checks to radio startup and remove duplicate spatial maintenance during steady playback.
+- Preserve 10 Hz positional updates while reducing spatial game-thread scheduling from 40 callbacks per second to 10.
+
 ## 0.17.0
 
 - Stop the local radio worker when the RV world unloads so playback cannot continue into the main menu.

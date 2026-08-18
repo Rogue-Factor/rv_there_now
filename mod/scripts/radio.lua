@@ -1,13 +1,12 @@
 local Radio = {}
 
-local DEFAULT_URL = "https://streams.radiomast.io/ref-128k-mp3-stereo"
+local DEFAULT_URL = "https://ice5.somafm.com/groovesalad-128-mp3"
 local OPEN_TIMEOUT_SECONDS = 120
-local SYNC_LEAD_SECONDS = 12
+local SYNC_LEAD_SECONDS = 4
 
 local module_source = debug.getinfo(1, "S").source:gsub("^@", "")
 local module_directory = module_source:match("^(.*[\\/])") or ""
-local DEFAULT_BRIDGE_PATH = module_directory .. "..\\bin\\rv-radio-bridge.exe"
-local DEFAULT_LAUNCHER_PATH = module_directory .. "..\\bin\\rv-radio-launcher.dll"
+local DEFAULT_BRIDGE_PATH = module_directory .. "..\\bin\\rv-radio-bridge.dll"
 
 local function default_is_valid(object)
     if not object then
@@ -57,9 +56,11 @@ local function default_status_path()
     return temporary .. "\\rv-there-now-radio.status"
 end
 
-local function is_youtube_url(url)
-    local host = url:lower():match("^https?://([^/:?]+)") or ""
-    return host == "youtu.be" or host == "youtube.com" or host:match("%.youtube%.com$") ~= nil
+local function is_supported_stream(url)
+    local host, path = url:lower():match("^https://([^/:?]+)(/[^?#]*)")
+    return host ~= nil
+        and host:match("^ice%d+%.somafm%.com$") ~= nil
+        and path:match("^/[a-z0-9]+%-128%-mp3$") ~= nil
 end
 
 function Radio.new(options)
@@ -67,21 +68,14 @@ function Radio.new(options)
     local self = {
         url = options.url or DEFAULT_URL,
         bridge_path = options.bridge_path or DEFAULT_BRIDGE_PATH,
-        launcher_path = options.launcher_path or DEFAULT_LAUNCHER_PATH,
         status_path = options.status_path or default_status_path(),
         url_path = options.url_path,
-        youtube_path = options.youtube_path,
-        pcm_path = options.pcm_path,
-        play_path = options.play_path,
-        confirmed_path = options.confirmed_path,
         spatial_path = options.spatial_path,
-        stop_path = options.stop_path,
-        launch_path = options.launch_path,
         now_playing_path = options.now_playing_path,
         is_valid = options.is_valid or default_is_valid,
         log = options.log or function() end,
-        load_launcher = options.load_launcher or function(path)
-            return package.loadlib(path, "rvtn_launch")
+        load_bridge = options.load_bridge or function(path, symbol)
+            return package.loadlib(path, symbol)
         end,
         get_player_controller = options.get_player_controller,
         get_server_time = options.get_server_time or function() return os.time() end,
@@ -102,12 +96,9 @@ function Radio.new(options)
         next_sync_retry_at = nil,
         tape_player = nil,
         closing = false,
-        stream_prefix = nil,
-        stream_sequence = 0,
-        stream_chunk_seconds = nil,
+        stream_ready = false,
         native_play_started = false,
         volume = math.max(0, math.min(1, tonumber(options.volume) or 0.5)),
-        spatial_update_tick = 0,
         last_left_gain = nil,
         last_right_gain = nil,
         now_playing = "",
@@ -116,42 +107,10 @@ function Radio.new(options)
     if not self.url_path then
         self.url_path = self.status_path:gsub("%.status$", ".url")
     end
-    if not self.youtube_path then
-        self.youtube_path = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-youtube.m4a"
-        )
-    end
-    if not self.pcm_path then
-        self.pcm_path = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-youtube.pcm"
-        )
-    end
-    if not self.play_path then
-        self.play_path = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.play"
-        )
-    end
     if not self.spatial_path then
         self.spatial_path = self.status_path:gsub(
             "rv%-there%-now%-radio%.status$", "rv-there-now-radio.spatial"
         )
-    end
-    if not self.confirmed_path then
-        self.confirmed_path = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.playing"
-        )
-    end
-    if not self.stop_path then
-        local derived, replacements = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.stop"
-        )
-        self.stop_path = replacements > 0 and derived or (self.status_path .. ".stop")
-    end
-    if not self.launch_path then
-        local derived, replacements = self.status_path:gsub(
-            "rv%-there%-now%-radio%.status$", "rv-there-now-radio.launch"
-        )
-        self.launch_path = replacements > 0 and derived or (self.status_path .. ".launch")
     end
     if not self.now_playing_path then
         local derived, replacements = self.status_path:gsub(
@@ -161,7 +120,7 @@ function Radio.new(options)
     end
     if not self.bridge_available then
         self.bridge_available = function()
-            return file_exists(self.bridge_path) and file_exists(self.launcher_path)
+            return file_exists(self.bridge_path)
         end
     end
     if not self.read_status then
@@ -214,10 +173,16 @@ function Radio.new(options)
         return true
     end
 
-    local write_atomic
+    local function call_bridge(symbol)
+        local loaded, bridge = pcall(self.load_bridge, self.bridge_path, symbol)
+        if not loaded or type(bridge) ~= "function" then
+            return false
+        end
+        return pcall(bridge)
+    end
 
     local function stop_helper()
-        write_atomic(self.stop_path, "stop")
+        return call_bridge("rvtn_stop")
     end
 
     local function start_helper()
@@ -234,29 +199,14 @@ function Radio.new(options)
             return false, "Could not write stream URL"
         end
         os.remove(self.status_path)
-        os.remove(self.youtube_path)
-        os.remove(self.pcm_path)
-        os.remove(self.play_path)
-        os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
         os.remove(self.now_playing_path)
-        local mode = is_youtube_url(self.url) and "youtube" or "stream"
-        if not write_atomic(self.launch_path, mode) then
-            return false, "Could not prepare hidden radio launcher"
-        end
-        local loaded, launcher = pcall(self.load_launcher, self.launcher_path)
-        if not loaded or type(launcher) ~= "function" then
-            os.remove(self.launch_path)
-            return false, "Bundled hidden radio launcher is unavailable"
-        end
-        local launched = pcall(launcher)
-        if not launched then
-            os.remove(self.launch_path)
+        if not call_bridge("rvtn_launch") then
             return false, "Could not launch bundled radio helper"
         end
-        self.backend = is_youtube_url(self.url) and "youtube" or "stream"
+        self.backend = "stream"
         self.state = "PREPARING"
-        self.detail = self.backend == "youtube" and "Downloading on all players" or "Preparing RV stream"
+        self.detail = "Preparing RV stream"
         self.open_started_at = os.time()
         return true
     end
@@ -266,7 +216,7 @@ function Radio.new(options)
         return ok and tonumber(value) or os.time()
     end
 
-    write_atomic = function(path, content)
+    local function write_atomic(path, content)
         local partial = path .. ".part"
         local file = io.open(partial, "wb")
         if not file then return false end
@@ -286,8 +236,6 @@ function Radio.new(options)
 
     local function update_native_spatial(force)
         if not self.native_play_started then return end
-        self.spatial_update_tick = self.spatial_update_tick + 1
-        if not force and self.spatial_update_tick % 4 ~= 0 then return end
         local volume = self.volume
         local left, right = volume, volume
         pcall(function()
@@ -321,10 +269,10 @@ function Radio.new(options)
         end
     end
 
-    local function start_native_playback(sequence)
+    local function start_native_playback()
         self.native_play_started = true
         update_native_spatial(true)
-        if not write_atomic(self.play_path, tostring(sequence or 0)) then
+        if not call_bridge("rvtn_play") then
             self.native_play_started = false
             return false, "Could not signal native audio playback"
         end
@@ -353,21 +301,16 @@ function Radio.new(options)
         end)
     end
 
-    local function stream_chunk_path(sequence)
-        return string.format("%s.%06d.pcm", self.stream_prefix, sequence)
-    end
-
     local function close_local(reason)
+        local helper_was_active = self.backend ~= nil or self.native_play_started
         self.closing = true
         self.state = "OFF"
-        stop_helper()
+        if helper_was_active then stop_helper() end
         if self.is_valid(self.tape_player) and self.is_valid(self.tape_player.Audio) then
             pcall(function()
                 self.tape_player.Audio:Stop()
             end)
         end
-        os.remove(self.youtube_path)
-        os.remove(self.pcm_path)
         self.detail = reason or ""
         self.backend = nil
         self.open_started_at = nil
@@ -375,19 +318,13 @@ function Radio.new(options)
         self.active_serial = nil
         self.pcm_sample_rate = nil
         self.pcm_channels = nil
-        self.stream_prefix = nil
-        self.stream_sequence = 0
-        self.stream_chunk_seconds = nil
+        self.stream_ready = false
         self.native_play_started = false
-        self.spatial_update_tick = 0
         self.last_left_gain = nil
         self.last_right_gain = nil
         self.now_playing = ""
-        os.remove(self.play_path)
-        os.remove(self.confirmed_path)
         os.remove(self.spatial_path)
         os.remove(self.now_playing_path)
-        os.remove(self.play_path .. ".part")
         os.remove(self.spatial_path .. ".part")
         self.sync_pending = false
         self.next_sync_retry_at = nil
@@ -439,6 +376,9 @@ function Radio.new(options)
         local scheme_end = url:lower():match("^https?://()")
         if url:lower():find("https?://", scheme_end) then
             return false, "URL contains another address"
+        end
+        if not is_supported_stream(url) then
+            return false, "Source is not a supported SomaFM stream"
         end
         self.url = url
         return true
@@ -579,8 +519,6 @@ function Radio.new(options)
             self.log("Internet radio stopped after leaving the RV session")
             return
         end
-        self:maintain_audio()
-
         local metadata = read_file(self.now_playing_path)
         if metadata and metadata ~= "" then
             metadata = metadata:gsub("[%c]", " "):gsub("%s+", " ")
@@ -616,39 +554,30 @@ function Radio.new(options)
             self.state = "FAILED"
             self.detail = "Restart required to load the new radio bridge"
             return
-        elseif status and status:match("^STREAM_PCM%s+") and not self.stream_prefix then
-            local prefix, sample_rate, channels, chunk_seconds = status:match(
-                "^STREAM_PCM%s+([^\t]+)\t(%d+)\t(%d+)\t(%d+)$"
-            )
-            if not prefix then
+        elseif status and status:match("^STREAM_READY%s+") and not self.stream_ready then
+            local sample_rate, channels = status:match("^STREAM_READY%s+(%d+)\t(%d+)$")
+            if not sample_rate then
                 self.state = "FAILED"
                 self.detail = "Radio helper returned invalid stream metadata"
                 return
             end
-            self.stream_prefix = prefix
+            self.stream_ready = true
             self.pcm_sample_rate = tonumber(sample_rate)
             self.pcm_channels = tonumber(channels)
-            self.stream_chunk_seconds = tonumber(chunk_seconds)
             self.detail = "Live stream buffered; waiting for synchronized start"
         end
 
         local now = server_time()
         if self.target_time and now < self.target_time then
             local remaining = math.max(1, math.ceil(self.target_time - now))
-            if self.stream_prefix then
+            if self.stream_ready then
                 self.detail = string.format("Live stream buffered; starting in %ds", remaining)
             end
         end
-        if self.stream_prefix and not self.native_play_started
+        if self.stream_ready and not self.native_play_started
             and self.target_time and now >= self.target_time then
-            local elapsed = math.max(0, now - self.target_time)
-            local sequence = math.floor(elapsed / self.stream_chunk_seconds)
-            for skipped = 0, sequence - 1 do
-                os.remove(stream_chunk_path(skipped))
-            end
-            local accepted, err = start_native_playback(sequence)
+            local accepted, err = start_native_playback()
             if accepted then
-                self.stream_sequence = sequence
                 self.state = "OPENING"
                 self.detail = "Starting native RV audio output"
                 self.log("Released synchronized native audio start")
@@ -659,8 +588,7 @@ function Radio.new(options)
             end
         end
 
-        if self.native_play_started and file_exists(self.confirmed_path)
-            and self.state ~= "PLAYING" then
+        if self.native_play_started and status == "PLAYING" and self.state ~= "PLAYING" then
             self.state = "PLAYING"
             self.detail = self.sync_pending
                 and "Local RV audio; waiting for Steam session"

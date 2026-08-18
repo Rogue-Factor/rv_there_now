@@ -5,6 +5,16 @@ This archive includes RV There Now and the tested UE4SS build. Do not use
 this archive with r2modman or Thunderstore Mod Manager; use the regular
 RVThereNow zip there instead.
 
+Support SomaFM
+--------------
+
+Internet radio in RV There Now is powered by SomaFM. Thank you to SomaFM for
+providing an amazing independent, listener-supported radio service. If you
+enjoy these stations, please help keep them on the air:
+
+Website: https://somafm.com/
+Donate:  https://somafm.com/support/
+
 Install
 -------
 
@@ -17,15 +27,14 @@ Install
    Ride\Binaries\Win64\dwmapi.dll
    Ride\Binaries\Win64\UE4SS.dll
    Ride\Binaries\Win64\Mods\RVThereNow\Scripts\main.lua
-   Ride\Binaries\Win64\Mods\RVThereNow\bin\rv-radio-bridge.exe
-   Ride\Binaries\Win64\Mods\RVThereNow\bin\rv-radio-launcher.dll
+   Ride\Binaries\Win64\Mods\RVThereNow\bin\rv-radio-bridge.dll
 
 5. Start the game normally. Press F6 to open the dashboard.
 
-Antivirus software may warn about UE4SS or the unsigned bundled radio binaries.
-UE4SS loads rv-radio-launcher.dll, which starts the bridge as a separate hidden
-process in the game's Windows or Proton environment. Norton may terminate the
-game when it blocks the launcher DLL. Download this archive only from the
+Antivirus software may warn about UE4SS or the unsigned bundled radio DLL.
+UE4SS loads rv-radio-bridge.dll directly, and its audio worker runs on a
+background thread inside the game process. Norton may terminate the game when
+it blocks the bridge DLL. Download this archive only from the
 official Rogue-Factor/rv_there_now GitHub release and verify its SHA-256 value.
 Report the false positive and allow only that verified file instead of disabling
 antivirus protection globally.

@@ -1,11 +1,7 @@
 local LobbySync = {}
 
-local URL_KEY = "rvtn_radio_url"
-local STATE_KEY = "rvtn_radio_state"
-local TARGET_KEY = "rvtn_radio_target"
-local VOLUME_KEY = "rvtn_radio_volume"
-local VOLUME_SERIAL_KEY = "rvtn_radio_volume_serial"
-local SERIAL_KEY = "rvtn_radio_serial"
+local EVENT_KEY = "rvtn_radio_event"
+local VOLUME_EVENT_KEY = "rvtn_radio_volume_event"
 local PRESENCE_CONTROL_KEY = "rvtn_radio_ctl"
 local PRESENCE_VOLUME_KEY = "rvtn_radio_volctl"
 local PRESENCE_CHUNK_PREFIX = "rvtn_radio_"
@@ -83,6 +79,7 @@ function LobbySync.new(options)
         last_serial = nil,
         last_volume_serial = nil,
         last_presence_request_at = 0,
+        next_presence_poll_at = 0,
         log = options.log or function() end,
     }
 
@@ -222,12 +219,12 @@ function LobbySync.new(options)
     local function get_data(key)
         local lobby = find_lobby()
         if not lobby then
-            return nil
+            return nil, false
         end
         local ok, result = pcall(function()
             return self.matchmaking:GetLobbyData(lobby, key)
         end)
-        return ok and as_string(result or "") or nil
+        return ok and as_string(result or "") or nil, ok
     end
 
     local function set_presence(key, value)
@@ -299,12 +296,11 @@ function LobbySync.new(options)
     function self:publish_start(url, target_time, volume)
         volume = math.max(0, math.min(1, tonumber(volume) or 0.5))
         local serial = next_serial()
-        local lobby_ok = set_data(URL_KEY, url)
-            and set_data(TARGET_KEY, string.format("%.3f", target_time))
-            and set_data(VOLUME_KEY, string.format("%.1f", volume))
-            and set_data(STATE_KEY, "play")
-            and set_data(SERIAL_KEY, serial)
-        local presence_ok = publish_presence_start(url, target_time, volume, serial)
+        local lobby_ok = set_data(EVENT_KEY, table.concat({
+            "play", string.format("%.3f", target_time), serial,
+            string.format("%.1f", volume), url,
+        }, "\t"))
+        local presence_ok = lobby_ok or publish_presence_start(url, target_time, volume, serial)
         if not lobby_ok and not presence_ok then
             return nil, "Steam session sync unavailable"
         end
@@ -320,8 +316,10 @@ function LobbySync.new(options)
 
     function self:publish_stop()
         local serial = next_serial()
-        local lobby_ok = set_data(STATE_KEY, "stop") and set_data(SERIAL_KEY, serial)
-        local presence_ok = publish_presence_stop(serial)
+        local lobby_ok = set_data(EVENT_KEY, table.concat({
+            "stop", "0", serial, "0", "",
+        }, "\t"))
+        local presence_ok = lobby_ok or publish_presence_stop(serial)
         if not lobby_ok and not presence_ok then
             return nil, "Steam session sync unavailable"
         end
@@ -332,9 +330,10 @@ function LobbySync.new(options)
     function self:publish_volume(volume)
         volume = math.max(0, math.min(1, tonumber(volume) or 0.5))
         local serial = next_serial()
-        local lobby_ok = set_data(VOLUME_KEY, string.format("%.1f", volume))
-            and set_data(VOLUME_SERIAL_KEY, serial)
-        local presence_ok = publish_presence_volume(volume, serial)
+        local lobby_ok = set_data(VOLUME_EVENT_KEY, table.concat({
+            serial, string.format("%.1f", volume),
+        }, "\t"))
+        local presence_ok = lobby_ok or publish_presence_volume(volume, serial)
         if not lobby_ok and not presence_ok then
             return nil, "Steam session sync unavailable"
         end
@@ -342,28 +341,40 @@ function LobbySync.new(options)
         return { state = "volume", serial = serial, volume = volume }
     end
 
+    local function read_lobby_volume()
+        local control, available = get_data(VOLUME_EVENT_KEY)
+        if not control or control == "" then return nil, nil, available end
+        local serial, volume_text = control:match("^([^\t]+)\t([%d%.]+)$")
+        local volume = tonumber(volume_text)
+        if not serial or not volume then return nil, nil, available end
+        return volume, serial, available
+    end
+
     local function poll_lobby()
-        local serial = get_data(SERIAL_KEY)
-        if not serial or serial == "" or serial == self.last_serial then
-            return nil
+        local control, available = get_data(EVENT_KEY)
+        if not control or control == "" then
+            return nil, available
         end
-        local state = get_data(STATE_KEY)
-        if state ~= "play" and state ~= "stop" then
-            return nil
+        local state, target_text, serial, volume_text, url = control:match(
+            "^(%a+)\t([^\t]*)\t([^\t]+)\t([%d%.]+)\t([^\t]*)$"
+        )
+        if not serial or serial == self.last_serial
+            or (state ~= "play" and state ~= "stop") then
+            return nil, available
         end
         if state == "stop" then
-            if get_data(SERIAL_KEY) ~= serial then
-                return nil
-            end
             self.last_serial = serial
-            return { state = state, serial = serial }
+            return { state = state, serial = serial }, available
         end
-        local url = get_data(URL_KEY)
-        local target_time = tonumber(get_data(TARGET_KEY))
-        local volume = tonumber(get_data(VOLUME_KEY)) or 0.5
-        local confirmed_serial = get_data(SERIAL_KEY)
-        if confirmed_serial ~= serial or not url or url == "" or not target_time then
-            return nil
+        local target_time = tonumber(target_text)
+        local volume = tonumber(volume_text)
+        if not url or url == "" or not target_time or not volume then
+            return nil, available
+        end
+        local current_volume, volume_serial = read_lobby_volume()
+        if current_volume then
+            volume = current_volume
+            self.last_volume_serial = volume_serial
         end
         self.last_serial = serial
         return {
@@ -372,16 +383,14 @@ function LobbySync.new(options)
             target_time = target_time,
             serial = serial,
             volume = volume,
-        }
+        }, available
     end
 
     local function poll_lobby_volume()
-        local serial = get_data(VOLUME_SERIAL_KEY)
-        if not serial or serial == "" or serial == self.last_volume_serial then return nil end
-        local volume = tonumber(get_data(VOLUME_KEY))
-        if not volume or get_data(VOLUME_SERIAL_KEY) ~= serial then return nil end
+        local volume, serial, available = read_lobby_volume()
+        if not serial or serial == self.last_volume_serial then return nil, available end
         self.last_volume_serial = serial
-        return { state = "volume", serial = serial, volume = volume }
+        return { state = "volume", serial = serial, volume = volume }, available
     end
 
     local function poll_presence()
@@ -443,7 +452,18 @@ function LobbySync.new(options)
     end
 
     function self:poll()
-        return poll_lobby() or poll_presence() or poll_lobby_volume() or poll_presence_volume()
+        local event, event_available = poll_lobby()
+        if event then return event end
+        local volume_event, volume_available = poll_lobby_volume()
+        if volume_event then return volume_event end
+        if event_available or volume_available then
+            return nil
+        end
+        local now = os.clock()
+        if now < self.next_presence_poll_at then return nil end
+        local presence_event = poll_presence() or poll_presence_volume()
+        if not presence_event then self.next_presence_poll_at = now + 1 end
+        return presence_event
     end
 
     function self:clear_lobby()

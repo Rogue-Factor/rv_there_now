@@ -1,9 +1,6 @@
 #define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <windows.h>
 #include <winhttp.h>
-#include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,21 +10,16 @@
 #define MA_NO_FLAC
 #define MINIAUDIO_IMPLEMENTATION
 #include "vendor/miniaudio.h"
-#include "mf_audio.h"
 #include "spatial_audio.h"
-#include "youtube_resolver.h"
 
 #define STOP_EVENT_NAME L"Local\\RVThereNowRadioStop"
+#define PLAY_EVENT_NAME L"Local\\RVThereNowRadioPlay"
 #define USER_AGENT L"RVThereNow-RadioBridge/0.1"
 #define REWIND_CACHE_SIZE (1024 * 1024)
-#define RELAY_PORT_FIRST 18765
-#define RELAY_PORT_LAST 18774
 #define STREAM_SAMPLE_RATE 48000
 #define STREAM_CHANNELS 1
-#define STREAM_CHUNK_SECONDS 1
-#define STREAM_READY_CHUNKS 1
-#define STREAM_RETAIN_CHUNKS 3
-#define ACCURADIO_MAX_TRACKS 64
+#define STREAM_BUFFER_SECONDS 8
+#define STREAM_READY_SECONDS 2
 #define NATIVE_READ_FRAMES 4096
 
 typedef struct HttpStream {
@@ -44,18 +36,12 @@ typedef struct HttpStream {
     volatile LONG failed;
 } HttpStream;
 
-typedef struct Playback {
-    ma_decoder decoder;
-    HttpStream* stream;
-} Playback;
-
 static wchar_t g_status_path[MAX_PATH];
 static wchar_t g_url_path[MAX_PATH];
-static wchar_t g_play_path[MAX_PATH];
-static wchar_t g_confirm_path[MAX_PATH];
-static wchar_t g_stop_path[MAX_PATH];
-static wchar_t g_launch_path[MAX_PATH];
 static wchar_t g_now_playing_path[MAX_PATH];
+static HMODULE g_module;
+static HANDLE g_worker_thread;
+static SRWLOCK g_worker_lock = SRWLOCK_INIT;
 
 static void initialize_temp_paths(void)
 {
@@ -64,10 +50,6 @@ static void initialize_temp_paths(void)
     if (length == 0 || length >= MAX_PATH) {
         wcscpy(g_status_path, L"rv-there-now-radio.status");
         wcscpy(g_url_path, L"rv-there-now-radio.url");
-        wcscpy(g_play_path, L"rv-there-now-radio.play");
-        wcscpy(g_confirm_path, L"rv-there-now-radio.playing");
-        wcscpy(g_stop_path, L"rv-there-now-radio.stop");
-        wcscpy(g_launch_path, L"rv-there-now-radio.launch");
         wcscpy(g_now_playing_path, L"rv-there-now-radio.nowplaying");
         return;
     }
@@ -75,45 +57,9 @@ static void initialize_temp_paths(void)
     g_status_path[MAX_PATH - 1] = L'\0';
     _snwprintf(g_url_path, MAX_PATH - 1, L"%lsrv-there-now-radio.url", temp_path);
     g_url_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(g_play_path, MAX_PATH - 1, L"%lsrv-there-now-radio.play", temp_path);
-    g_play_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(g_confirm_path, MAX_PATH - 1,
-        L"%lsrv-there-now-radio.playing", temp_path);
-    g_confirm_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(g_stop_path, MAX_PATH - 1,
-        L"%lsrv-there-now-radio.stop", temp_path);
-    g_stop_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(g_launch_path, MAX_PATH - 1,
-        L"%lsrv-there-now-radio.launch", temp_path);
-    g_launch_path[MAX_PATH - 1] = L'\0';
     _snwprintf(g_now_playing_path, MAX_PATH - 1,
         L"%lsrv-there-now-radio.nowplaying", temp_path);
     g_now_playing_path[MAX_PATH - 1] = L'\0';
-}
-
-static int read_launch_mode(wchar_t mode[16])
-{
-    FILE* file = _wfopen(g_launch_path, L"rb");
-    char value[16];
-    size_t length;
-    if (file == NULL) return 0;
-    length = fread(value, 1, sizeof(value) - 1, file);
-    fclose(file);
-    DeleteFileW(g_launch_path);
-    while (length > 0 && (value[length - 1] == '\r' || value[length - 1] == '\n'
-            || value[length - 1] == ' ' || value[length - 1] == '\t')) {
-        --length;
-    }
-    value[length] = '\0';
-    if (strcmp(value, "stream") == 0) {
-        wcscpy(mode, L"--stream-pcm");
-        return 1;
-    }
-    if (strcmp(value, "youtube") == 0) {
-        wcscpy(mode, L"--prepare-youtube");
-        return 1;
-    }
-    return 0;
 }
 
 static int read_url_file(wchar_t* url, size_t capacity)
@@ -354,160 +300,6 @@ static int read_stream_audio(HttpStream* stream, unsigned char* output,
     return 1;
 }
 
-static int module_directory(wchar_t* directory, size_t capacity)
-{
-    DWORD length = GetModuleFileNameW(NULL, directory, (DWORD)capacity);
-    wchar_t* separator;
-    if (length == 0 || length >= capacity) return 0;
-    separator = wcsrchr(directory, L'\\');
-    if (separator == NULL) return 0;
-    *separator = L'\0';
-    return 1;
-}
-
-static int download_http_file(const wchar_t* url, const wchar_t* path)
-{
-    HttpStream stream;
-    FILE* output;
-    int succeeded = 0;
-
-    if (!open_http_stream(url, &stream, 0)) return 0;
-    output = _wfopen(path, L"wb");
-    if (output == NULL) {
-        close_http_stream(&stream);
-        return 0;
-    }
-    for (;;) {
-        unsigned char buffer[32768];
-        DWORD bytes_read = 0;
-        if (!WinHttpReadData(stream.request, buffer, sizeof(buffer), &bytes_read)) break;
-        if (bytes_read == 0) {
-            succeeded = 1;
-            break;
-        }
-        if (fwrite(buffer, 1, bytes_read, output) != bytes_read) break;
-    }
-    fclose(output);
-    close_http_stream(&stream);
-    if (!succeeded) DeleteFileW(path);
-    return succeeded;
-}
-
-static int extract_accuradio_channel(const wchar_t* url, wchar_t channel[25])
-{
-    const wchar_t* host;
-    const wchar_t* path;
-    const wchar_t* marker = L"/channel/";
-    size_t host_length;
-    int index;
-
-    if (_wcsnicmp(url, L"https://", 8) == 0) host = url + 8;
-    else if (_wcsnicmp(url, L"http://", 7) == 0) host = url + 7;
-    else return 0;
-    host_length = wcscspn(host, L"/:?");
-    if (!((host_length == 13 && _wcsnicmp(host, L"accuradio.com", 13) == 0)
-        || (host_length == 17 && _wcsnicmp(host, L"www.accuradio.com", 17) == 0))) {
-        return 0;
-    }
-    path = wcschr(host, L'/');
-    if (path == NULL || _wcsnicmp(path, marker, wcslen(marker)) != 0) return 0;
-    path += wcslen(marker);
-    for (index = 0; index < 24; ++index) {
-        wchar_t value = path[index];
-        if (!((value >= L'0' && value <= L'9')
-            || (value >= L'a' && value <= L'f')
-            || (value >= L'A' && value <= L'F'))) {
-            return 0;
-        }
-        channel[index] = value;
-    }
-    channel[24] = L'\0';
-    return path[24] == L'\0' || path[24] == L'/' || path[24] == L'?' || path[24] == L'#';
-}
-
-static int resolve_accuradio_tracks(
-    const wchar_t* channel,
-    wchar_t tracks[ACCURADIO_MAX_TRACKS][4096],
-    char titles[ACCURADIO_MAX_TRACKS][512],
-    int* track_count)
-{
-    wchar_t temp[MAX_PATH];
-    wchar_t playlist_path[MAX_PATH];
-    wchar_t tracks_path[MAX_PATH];
-    wchar_t playlist_url[1024];
-    wchar_t directory[4096];
-    wchar_t quickjs[4096];
-    wchar_t script[4096];
-    wchar_t command[16384];
-    STARTUPINFOW startup;
-    PROCESS_INFORMATION process;
-    DWORD exit_code = 1;
-    FILE* file = NULL;
-    char line[8192];
-    int count = 0;
-    int succeeded = 0;
-
-    *track_count = 0;
-    if (GetTempPathW(MAX_PATH, temp) == 0 || !module_directory(directory, 4096)) return 0;
-    _snwprintf(playlist_path, MAX_PATH - 1, L"%lsrv-there-now-accuradio.json", temp);
-    playlist_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(tracks_path, MAX_PATH - 1, L"%lsrv-there-now-accuradio.urls", temp);
-    tracks_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(playlist_url, 1023,
-        L"https://www.accuradio.com/playlist/json/%ls/?ando=0&intro=true&spotschedule=5488775f0d1140151d7e3402&fa=null&rand=%lu",
-        channel, (unsigned long)GetTickCount());
-    playlist_url[1023] = L'\0';
-    _snwprintf(quickjs, 4095, L"%ls\\qjs.exe", directory);
-    quickjs[4095] = L'\0';
-    _snwprintf(script, 4095, L"%ls\\accuradio-resolver.js", directory);
-    script[4095] = L'\0';
-    DeleteFileW(playlist_path);
-    DeleteFileW(tracks_path);
-    if (!download_http_file(playlist_url, playlist_path)) goto cleanup;
-    if (GetFileAttributesW(quickjs) == INVALID_FILE_ATTRIBUTES
-        || GetFileAttributesW(script) == INVALID_FILE_ATTRIBUTES) goto cleanup;
-    if (_snwprintf(command, (sizeof(command) / sizeof(command[0])) - 1,
-            L"\"%ls\" --std \"%ls\" \"%ls\" \"%ls\"",
-            quickjs, script, playlist_path, tracks_path) < 0) goto cleanup;
-    memset(&startup, 0, sizeof(startup));
-    memset(&process, 0, sizeof(process));
-    startup.cb = sizeof(startup);
-    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-            NULL, directory, &startup, &process)) goto cleanup;
-    CloseHandle(process.hThread);
-    WaitForSingleObject(process.hProcess, 30000);
-    GetExitCodeProcess(process.hProcess, &exit_code);
-    CloseHandle(process.hProcess);
-    if (exit_code != 0) goto cleanup;
-    file = _wfopen(tracks_path, L"rb");
-    if (file == NULL) goto cleanup;
-    while (count < ACCURADIO_MAX_TRACKS && fgets(line, sizeof(line), file) != NULL) {
-        size_t length = strcspn(line, "\r\n");
-        char* separator;
-        line[length] = '\0';
-        separator = strchr(line, '\t');
-        if (separator == NULL) continue;
-        *separator = '\0';
-        ++separator;
-        if (line[0] == '\0' || separator[0] == '\0'
-            || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                line, -1, tracks[count], 4096) <= 0) continue;
-        strncpy(titles[count], separator, sizeof(titles[count]) - 1);
-        titles[count][sizeof(titles[count]) - 1] = '\0';
-        ++count;
-    }
-    fclose(file);
-    file = NULL;
-    succeeded = count > 0;
-    *track_count = count;
-
-cleanup:
-    if (file != NULL) fclose(file);
-    DeleteFileW(playlist_path);
-    DeleteFileW(tracks_path);
-    return succeeded;
-}
-
 static ma_result decoder_read(ma_decoder* decoder, void* output, size_t bytes_to_read, size_t* bytes_read)
 {
     HttpStream* stream = (HttpStream*)decoder->pUserData;
@@ -596,22 +388,6 @@ static ma_result decoder_seek(ma_decoder* decoder, ma_int64 offset, ma_seek_orig
     return MA_BAD_SEEK;
 }
 
-static void audio_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count)
-{
-    Playback* playback = (Playback*)device->pUserData;
-    ma_uint64 frames_read = 0;
-    ma_result result;
-    (void)input;
-
-    memset(output, 0, (size_t)frame_count * 2 * sizeof(float));
-    result = ma_decoder_read_pcm_frames(&playback->decoder, output, frame_count, &frames_read);
-    spatial_audio_apply_f32((float*)output, (size_t)frames_read, 2);
-    if (result != MA_SUCCESS && result != MA_AT_END) {
-        InterlockedExchange(&playback->stream->failed, 1);
-        InterlockedExchange(&playback->stream->ended, 1);
-    }
-}
-
 static int signal_existing_bridge(void)
 {
     HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, STOP_EVENT_NAME);
@@ -623,367 +399,38 @@ static int signal_existing_bridge(void)
     return 1;
 }
 
-static DWORD WINAPI monitor_stop_file(void* parameter)
-{
-    HANDLE event = (HANDLE)parameter;
-    while (WaitForSingleObject(event, 25) == WAIT_TIMEOUT) {
-        if (GetFileAttributesW(g_stop_path) != INVALID_FILE_ATTRIBUTES) {
-            DeleteFileW(g_stop_path);
-            SetEvent(event);
-            break;
-        }
-    }
-    CloseHandle(event);
-    return 0;
-}
-
-static void start_stop_file_monitor(HANDLE event)
-{
-    HANDLE duplicate = NULL;
-    HANDLE thread;
-    if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &duplicate,
-            0, FALSE, DUPLICATE_SAME_ACCESS)) {
-        return;
-    }
-    thread = CreateThread(NULL, 0, monitor_stop_file, duplicate, 0, NULL);
-    if (thread == NULL) {
-        CloseHandle(duplicate);
-        return;
-    }
-    CloseHandle(thread);
-}
-
 static HANDLE create_stop_event(void)
 {
-    HANDLE event;
-    int attempt;
-    for (attempt = 0; attempt < 30; ++attempt) {
-        event = CreateEventW(NULL, TRUE, FALSE, STOP_EVENT_NAME);
-        if (event != NULL && GetLastError() != ERROR_ALREADY_EXISTS) {
-            DeleteFileW(g_stop_path);
-            start_stop_file_monitor(event);
-            return event;
-        }
-        if (event != NULL) {
-            SetEvent(event);
-            CloseHandle(event);
-        }
-        Sleep(100);
+    HANDLE event = CreateEventW(NULL, TRUE, FALSE, STOP_EVENT_NAME);
+    if (event != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(event);
+        return NULL;
     }
-    return NULL;
+    return event;
 }
 
-static int process_is_running(const wchar_t* executable_name)
+static int signal_named_event(const wchar_t* name)
 {
-    HANDLE snapshot;
-    PROCESSENTRY32W entry;
-    int found = 0;
-    if (executable_name == NULL) {
-        return 1;
-    }
-
-    snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        return 1;
-    }
-    memset(&entry, 0, sizeof(entry));
-    entry.dwSize = sizeof(entry);
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (_wcsicmp(entry.szExeFile, executable_name) == 0) {
-                found = 1;
-                break;
-            }
-        } while (Process32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return found;
-}
-
-static int run_bridge(const wchar_t* url, float volume, const wchar_t* watched_process)
-{
-    HANDLE stop_event;
-    HttpStream stream;
-    Playback playback;
-    ma_decoder_config decoder_config;
-    ma_device_config device_config;
-    ma_device device;
-    ma_result result;
-    DWORD wait_result;
-    int exit_code = 0;
-
-    write_status(L"OPENING");
-    stop_event = create_stop_event();
-    if (stop_event == NULL) {
-        write_status(L"ERROR Could not acquire bridge event");
-        return 2;
-    }
-    write_status(L"OPENING HTTP");
-    if (!open_http_stream(url, &stream, 1)) {
-        write_status(L"ERROR HTTP connection failed");
-        CloseHandle(stop_event);
-        return 3;
-    }
-
-    write_status(L"OPENING DECODER");
-    memset(&playback, 0, sizeof(playback));
-    playback.stream = &stream;
-    decoder_config = ma_decoder_config_init(ma_format_f32, 2, 48000);
-    result = ma_decoder_init(decoder_read, decoder_seek, &stream, &decoder_config, &playback.decoder);
-    if (result != MA_SUCCESS) {
-        write_status(L"ERROR MP3 decoder initialization failed");
-        close_http_stream(&stream);
-        CloseHandle(stop_event);
-        return 4;
-    }
-
-    write_status(L"OPENING OUTPUT");
-    device_config = ma_device_config_init(ma_device_type_playback);
-    device_config.playback.format = ma_format_f32;
-    device_config.playback.channels = 2;
-    device_config.sampleRate = 48000;
-    device_config.dataCallback = audio_callback;
-    device_config.pUserData = &playback;
-    result = ma_device_init(NULL, &device_config, &device);
-    if (result != MA_SUCCESS) {
-        write_status(L"ERROR Audio output initialization failed");
-        ma_decoder_uninit(&playback.decoder);
-        close_http_stream(&stream);
-        CloseHandle(stop_event);
-        return 5;
-    }
-    ma_device_set_master_volume(&device, volume);
-    result = ma_device_start(&device);
-    if (result != MA_SUCCESS) {
-        write_status(L"ERROR Audio output start failed");
-        ma_device_uninit(&device);
-        ma_decoder_uninit(&playback.decoder);
-        close_http_stream(&stream);
-        CloseHandle(stop_event);
-        return 6;
-    }
-
-    write_status(L"PLAYING RV positional audio");
-    for (;;) {
-        wait_result = WaitForSingleObject(stop_event, 100);
-        if (wait_result == WAIT_OBJECT_0) {
-            break;
-        }
-        if (!process_is_running(watched_process)) {
-            break;
-        }
-        spatial_audio_update();
-        if (InterlockedCompareExchange(&stream.ended, 0, 0) != 0) {
-            if (InterlockedCompareExchange(&stream.failed, 0, 0) != 0) {
-                write_status(L"ERROR Stream read failed");
-                exit_code = 7;
-            } else {
-                write_status(L"ERROR Stream ended");
-                exit_code = 8;
-            }
-            break;
-        }
-    }
-
-    ma_device_uninit(&device);
-    ma_decoder_uninit(&playback.decoder);
-    close_http_stream(&stream);
-    CloseHandle(stop_event);
-    if (exit_code == 0) {
-        write_status(L"OFF");
-    }
-    return exit_code;
-}
-
-static int socket_send_all(SOCKET client, const char* data, int length)
-{
-    int offset = 0;
-    while (offset < length) {
-        int sent = send(client, data + offset, length - offset, 0);
-        if (sent <= 0) return 0;
-        offset += sent;
-    }
+    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    if (event == NULL) return 0;
+    SetEvent(event);
+    CloseHandle(event);
     return 1;
 }
 
-static int run_relay(const wchar_t* url, const wchar_t* watched_process)
-{
-    static const char response[] =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: audio/mpeg\r\n"
-        "Cache-Control: no-store\r\n"
-        "Connection: close\r\n\r\n";
-    WSADATA winsock;
-    SOCKET server = INVALID_SOCKET;
-    HANDLE stop_event;
-    unsigned short port;
-    int exit_code = 0;
-    wchar_t ready_status[128];
-
-    write_status(L"OPENING Local RV audio relay");
-    stop_event = create_stop_event();
-    if (stop_event == NULL) {
-        write_status(L"ERROR Could not acquire bridge event");
-        return 40;
-    }
-    if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) {
-        write_status(L"ERROR Local relay networking failed");
-        CloseHandle(stop_event);
-        return 41;
-    }
-
-    for (port = RELAY_PORT_FIRST; port <= RELAY_PORT_LAST; ++port) {
-        struct sockaddr_in address;
-        server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (server == INVALID_SOCKET) break;
-        memset(&address, 0, sizeof(address));
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        address.sin_port = htons(port);
-        if (bind(server, (const struct sockaddr*)&address, sizeof(address)) == 0
-            && listen(server, 1) == 0) {
-            break;
-        }
-        closesocket(server);
-        server = INVALID_SOCKET;
-    }
-    if (server == INVALID_SOCKET) {
-        write_status(L"ERROR No local relay port is available");
-        WSACleanup();
-        CloseHandle(stop_event);
-        return 42;
-    }
-
-    _snwprintf(ready_status, (sizeof(ready_status) / sizeof(ready_status[0])) - 1,
-        L"READY http://127.0.0.1:%u/rv-radio.mp3", (unsigned int)port);
-    ready_status[(sizeof(ready_status) / sizeof(ready_status[0])) - 1] = L'\0';
-    write_status(ready_status);
-
-    for (;;) {
-        fd_set readable;
-        struct timeval timeout;
-        SOCKET client;
-        HttpStream stream;
-        char request[4096];
-        int received;
-
-        if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-            || !process_is_running(watched_process)) {
-            break;
-        }
-        FD_ZERO(&readable);
-        FD_SET(server, &readable);
-        timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
-        if (select(0, &readable, NULL, NULL, &timeout) <= 0) continue;
-        client = accept(server, NULL, NULL);
-        if (client == INVALID_SOCKET) continue;
-
-        received = recv(client, request, sizeof(request), 0);
-        if (received <= 0 || !open_http_stream(url, &stream, 0)) {
-            closesocket(client);
-            write_status(ready_status);
-            continue;
-        }
-        if (!socket_send_all(client, response, (int)strlen(response))) {
-            close_http_stream(&stream);
-            closesocket(client);
-            write_status(ready_status);
-            continue;
-        }
-
-        write_status(L"PLAYING Unreal RV audio");
-        for (;;) {
-            unsigned char buffer[32768];
-            DWORD bytes_read = 0;
-            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-                || !process_is_running(watched_process)) {
-                break;
-            }
-            if (!WinHttpReadData(stream.request, buffer, sizeof(buffer), &bytes_read)
-                || bytes_read == 0
-                || !socket_send_all(client, (const char*)buffer, (int)bytes_read)) {
-                break;
-            }
-        }
-        close_http_stream(&stream);
-        closesocket(client);
-        if (WaitForSingleObject(stop_event, 0) != WAIT_OBJECT_0) {
-            write_status(ready_status);
-        }
-    }
-
-    closesocket(server);
-    WSACleanup();
-    CloseHandle(stop_event);
-    write_status(L"OFF");
-    return exit_code;
-}
-
-static int write_pcm_chunk(
-    const wchar_t* prefix,
-    unsigned int sequence,
-    const int16_t* samples,
-    size_t byte_count)
-{
-    wchar_t final_path[MAX_PATH];
-    wchar_t partial_path[MAX_PATH];
-    FILE* file;
-
-    _snwprintf(final_path, MAX_PATH - 1, L"%ls.%06u.pcm", prefix, sequence);
-    final_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(partial_path, MAX_PATH - 1, L"%ls.%06u.part", prefix, sequence);
-    partial_path[MAX_PATH - 1] = L'\0';
-    file = _wfopen(partial_path, L"wb");
-    if (file == NULL) return 0;
-    if (fwrite(samples, 1, byte_count, file) != byte_count || fclose(file) != 0) {
-        DeleteFileW(partial_path);
-        return 0;
-    }
-    if (!MoveFileExW(partial_path, final_path,
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(partial_path);
-        return 0;
-    }
-    return 1;
-}
-
-static int pcm_chunk_exists(const wchar_t* prefix, unsigned int sequence)
-{
-    wchar_t path[MAX_PATH];
-    _snwprintf(path, MAX_PATH - 1, L"%ls.%06u.pcm", prefix, sequence);
-    path[MAX_PATH - 1] = L'\0';
-    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
-}
-
-static void delete_pcm_chunks(const wchar_t* prefix, unsigned int count)
-{
-    unsigned int sequence;
-    for (sequence = 0; sequence < count; ++sequence) {
-        wchar_t path[MAX_PATH];
-        _snwprintf(path, MAX_PATH - 1, L"%ls.%06u.pcm", prefix, sequence);
-        path[MAX_PATH - 1] = L'\0';
-        DeleteFileW(path);
-        _snwprintf(path, MAX_PATH - 1, L"%ls.%06u.part", prefix, sequence);
-        path[MAX_PATH - 1] = L'\0';
-        DeleteFileW(path);
-    }
-}
-
-typedef struct NativeChunkPlayer {
+typedef struct NativeStreamPlayer {
     ma_device device;
-    wchar_t prefix[MAX_PATH];
-    FILE* current_file;
-    HANDLE confirmation_thread;
-    unsigned int sequence;
-    DWORD last_spatial_update;
+    ma_pcm_rb ring;
+    HANDLE play_event;
+    HANDLE control_thread;
     volatile LONG started;
     volatile LONG confirmed;
     volatile LONG shutting_down;
+    volatile LONG status_confirmed;
     int initialized;
-} NativeChunkPlayer;
+} NativeStreamPlayer;
 
-static void confirm_native_output(NativeChunkPlayer* player,
+static void confirm_native_output(NativeStreamPlayer* player,
     const int16_t* samples, size_t frames)
 {
     size_t frame;
@@ -995,157 +442,120 @@ static void confirm_native_output(NativeChunkPlayer* player,
     }
 }
 
-static DWORD WINAPI native_confirmation_thread(void* context)
+static DWORD WINAPI native_control_thread(void* context)
 {
-    NativeChunkPlayer* player = (NativeChunkPlayer*)context;
+    NativeStreamPlayer* player = (NativeStreamPlayer*)context;
     while (InterlockedCompareExchange(&player->shutting_down, 0, 0) == 0) {
+        if (InterlockedCompareExchange(&player->started, 0, 0) == 0
+            && WaitForSingleObject(player->play_event, 0) == WAIT_OBJECT_0) {
+            InterlockedExchange(&player->started, 1);
+        }
+        spatial_audio_update();
         if (InterlockedCompareExchange(&player->confirmed, 0, 0) != 0) {
-            HANDLE marker = CreateFileW(g_confirm_path, GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (marker != INVALID_HANDLE_VALUE) {
-                CloseHandle(marker);
-                return 0;
+            if (InterlockedCompareExchange(&player->status_confirmed, 1, 0) == 0) {
+                write_status(L"PLAYING");
             }
         }
-        Sleep(10);
+        Sleep(50);
     }
     return 0;
 }
 
-static int read_play_sequence(unsigned int* sequence)
-{
-    FILE* file = _wfopen(g_play_path, L"rb");
-    unsigned int value = 0;
-    if (file == NULL) return 0;
-    if (fscanf(file, "%u", &value) != 1) {
-        fclose(file);
-        return 0;
-    }
-    fclose(file);
-    *sequence = value;
-    return 1;
-}
-
-static void native_chunk_callback(
+static void native_stream_callback(
     ma_device* device, void* output, const void* input, ma_uint32 frame_count)
 {
-    NativeChunkPlayer* player = (NativeChunkPlayer*)device->pUserData;
+    NativeStreamPlayer* player = (NativeStreamPlayer*)device->pUserData;
     int16_t* stereo = (int16_t*)output;
     ma_uint32 written = 0;
     (void)input;
     memset(stereo, 0, (size_t)frame_count * 2 * sizeof(int16_t));
-    if (InterlockedCompareExchange(&player->started, 0, 0) == 0) {
-        unsigned int sequence = 0;
-        if (!read_play_sequence(&sequence)) return;
-        player->sequence = sequence;
-        InterlockedExchange(&player->started, 1);
-    }
-    if (GetTickCount() - player->last_spatial_update >= 50) {
-        spatial_audio_update();
-        player->last_spatial_update = GetTickCount();
-    }
+    if (InterlockedCompareExchange(&player->started, 0, 0) == 0) return;
     while (written < frame_count) {
-        int16_t mono[NATIVE_READ_FRAMES];
-        size_t requested = frame_count - written;
-        size_t received;
-        if (requested > NATIVE_READ_FRAMES) requested = NATIVE_READ_FRAMES;
-        if (player->current_file == NULL) {
-            wchar_t path[MAX_PATH];
-            _snwprintf(path, MAX_PATH - 1, L"%ls.%06u.pcm",
-                player->prefix, player->sequence);
-            path[MAX_PATH - 1] = L'\0';
-            player->current_file = _wfopen(path, L"rb");
-            if (player->current_file == NULL) return;
-        }
-        received = fread(mono, sizeof(int16_t), requested, player->current_file);
-        if (received > 0) {
-            confirm_native_output(player, mono, received);
-            spatial_audio_mono_to_stereo_s16(
-                mono, stereo + (size_t)written * 2, received);
-            written += (ma_uint32)received;
-        }
-        if (received < requested) {
-            wchar_t path[MAX_PATH];
-            fclose(player->current_file);
-            player->current_file = NULL;
-            _snwprintf(path, MAX_PATH - 1, L"%ls.%06u.pcm",
-                player->prefix, player->sequence);
-            path[MAX_PATH - 1] = L'\0';
-            DeleteFileW(path);
-            ++player->sequence;
-            if (received == 0) continue;
-        }
+        ma_uint32 available = frame_count - written;
+        void* buffer = NULL;
+        if (ma_pcm_rb_acquire_read(&player->ring, &available, &buffer) != MA_SUCCESS
+            || available == 0) break;
+        confirm_native_output(player, (const int16_t*)buffer, available);
+        spatial_audio_mono_to_stereo_s16((const int16_t*)buffer,
+            stereo + (size_t)written * 2, available);
+        ma_pcm_rb_commit_read(&player->ring, available);
+        written += available;
     }
 }
 
-static int native_chunk_player_init(
-    NativeChunkPlayer* player, const wchar_t* prefix, unsigned int sample_rate)
+static int native_stream_player_init(NativeStreamPlayer* player, unsigned int sample_rate)
 {
     ma_device_config config;
     memset(player, 0, sizeof(*player));
-    wcsncpy(player->prefix, prefix, MAX_PATH - 1);
-    player->prefix[MAX_PATH - 1] = L'\0';
+    if (ma_pcm_rb_init(ma_format_s16, STREAM_CHANNELS,
+            sample_rate * STREAM_BUFFER_SECONDS, NULL, NULL, &player->ring) != MA_SUCCESS) {
+        return 0;
+    }
+    player->play_event = CreateEventW(NULL, TRUE, FALSE, PLAY_EVENT_NAME);
+    if (player->play_event == NULL || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (player->play_event != NULL) CloseHandle(player->play_event);
+        ma_pcm_rb_uninit(&player->ring);
+        return 0;
+    }
     config = ma_device_config_init(ma_device_type_playback);
     config.playback.format = ma_format_s16;
     config.playback.channels = 2;
     config.sampleRate = sample_rate;
-    config.dataCallback = native_chunk_callback;
+    config.dataCallback = native_stream_callback;
     config.pUserData = player;
-    if (ma_device_init(NULL, &config, &player->device) != MA_SUCCESS) return 0;
+    if (ma_device_init(NULL, &config, &player->device) != MA_SUCCESS) {
+        CloseHandle(player->play_event);
+        ma_pcm_rb_uninit(&player->ring);
+        return 0;
+    }
     player->initialized = 1;
-    player->confirmation_thread = CreateThread(NULL, 0,
-        native_confirmation_thread, player, 0, NULL);
-    if (player->confirmation_thread == NULL) {
+    player->control_thread = CreateThread(NULL, 0, native_control_thread, player, 0, NULL);
+    if (player->control_thread == NULL) {
         ma_device_uninit(&player->device);
+        CloseHandle(player->play_event);
+        ma_pcm_rb_uninit(&player->ring);
         player->initialized = 0;
         return 0;
     }
     if (ma_device_start(&player->device) != MA_SUCCESS) {
         InterlockedExchange(&player->shutting_down, 1);
-        WaitForSingleObject(player->confirmation_thread, INFINITE);
-        CloseHandle(player->confirmation_thread);
-        player->confirmation_thread = NULL;
+        WaitForSingleObject(player->control_thread, INFINITE);
+        CloseHandle(player->control_thread);
+        player->control_thread = NULL;
         ma_device_uninit(&player->device);
+        CloseHandle(player->play_event);
+        ma_pcm_rb_uninit(&player->ring);
         player->initialized = 0;
         return 0;
     }
     return 1;
 }
 
-static void native_chunk_player_uninit(NativeChunkPlayer* player)
+static void native_stream_player_uninit(NativeStreamPlayer* player)
 {
     InterlockedExchange(&player->shutting_down, 1);
     if (player->initialized) ma_device_uninit(&player->device);
-    if (player->current_file != NULL) fclose(player->current_file);
-    player->current_file = NULL;
-    if (player->confirmation_thread != NULL) {
-        WaitForSingleObject(player->confirmation_thread, INFINITE);
-        CloseHandle(player->confirmation_thread);
-        player->confirmation_thread = NULL;
+    if (player->control_thread != NULL) {
+        WaitForSingleObject(player->control_thread, INFINITE);
+        CloseHandle(player->control_thread);
+        player->control_thread = NULL;
     }
+    if (player->play_event != NULL) CloseHandle(player->play_event);
+    ma_pcm_rb_uninit(&player->ring);
     player->initialized = 0;
 }
 
-static int run_stream_pcm(const wchar_t* url, const wchar_t* watched_process)
+static int run_stream_pcm(const wchar_t* url)
 {
     HANDLE stop_event;
     HttpStream stream;
     ma_decoder decoder;
     ma_decoder_config decoder_config;
     ma_result result;
-    int16_t* samples = NULL;
-    const ma_uint64 frames_per_chunk = STREAM_SAMPLE_RATE * STREAM_CHUNK_SECONDS;
-    const size_t bytes_per_chunk = (size_t)frames_per_chunk
-        * STREAM_CHANNELS * sizeof(int16_t);
-    wchar_t temp_path[MAX_PATH];
-    wchar_t prefix[MAX_PATH];
-    wchar_t status[MAX_PATH + 96];
-    unsigned int sequence = 0;
+    int ready = 0;
     int exit_code = 0;
-    NativeChunkPlayer player;
+    NativeStreamPlayer player;
 
-    prefix[0] = L'\0';
     memset(&player, 0, sizeof(player));
 
     write_status(L"OPENING Live stream decoder");
@@ -1168,88 +578,58 @@ static int run_stream_pcm(const wchar_t* url, const wchar_t* watched_process)
         CloseHandle(stop_event);
         return 62;
     }
-    if (GetTempPathW(MAX_PATH, temp_path) == 0
-        || wcslen(temp_path) + 48 >= MAX_PATH) {
-        write_status(L"ERROR Stream temporary path is unavailable");
-        exit_code = 63;
-        goto cleanup;
+    if (!native_stream_player_init(&player, STREAM_SAMPLE_RATE)) {
+        write_status(L"ERROR Native audio output initialization failed");
+        ma_decoder_uninit(&decoder);
+        close_http_stream(&stream);
+        CloseHandle(stop_event);
+        return 64;
     }
-    _snwprintf(prefix, MAX_PATH - 1, L"%lsrv-there-now-stream-%lu",
-        temp_path, (unsigned long)GetCurrentProcessId());
-    prefix[MAX_PATH - 1] = L'\0';
-    samples = (int16_t*)malloc(bytes_per_chunk);
-    if (samples == NULL) {
-        write_status(L"ERROR Could not allocate stream PCM buffer");
-        exit_code = 64;
-        goto cleanup;
-    }
+    write_status(L"BUFFERING Live stream");
 
     for (;;) {
+        ma_uint32 frames_to_write;
+        void* write_buffer = NULL;
         ma_uint64 frames_read = 0;
-        ma_uint64 total_frames = 0;
-        if (sequence >= STREAM_RETAIN_CHUNKS) {
-            unsigned int oldest = sequence - STREAM_RETAIN_CHUNKS;
-            while (pcm_chunk_exists(prefix, oldest)) {
-                if (WaitForSingleObject(stop_event, 50) == WAIT_OBJECT_0
-                    || !process_is_running(watched_process)) {
-                    goto cleanup;
-                }
-            }
+        if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0) goto cleanup;
+        frames_to_write = ma_pcm_rb_available_write(&player.ring);
+        if (frames_to_write == 0) {
+            if (WaitForSingleObject(stop_event, 10) == WAIT_OBJECT_0) goto cleanup;
+            continue;
         }
-        while (total_frames < frames_per_chunk) {
-            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-                || !process_is_running(watched_process)) {
-                goto cleanup;
-            }
-            frames_read = 0;
-            result = ma_decoder_read_pcm_frames(&decoder,
-                samples + (size_t)total_frames * STREAM_CHANNELS,
-                frames_per_chunk - total_frames, &frames_read);
-            total_frames += frames_read;
-            if (result != MA_SUCCESS && result != MA_AT_END) {
-                write_status(L"ERROR Live stream decoding failed");
-                exit_code = 65;
-                goto cleanup;
-            }
-            if (result == MA_AT_END || frames_read == 0) {
-                write_status(L"ERROR Live stream ended");
-                exit_code = 66;
-                goto cleanup;
-            }
-        }
-        if (!write_pcm_chunk(prefix, sequence, samples, bytes_per_chunk)) {
-            write_status(L"ERROR Could not write live stream buffer");
+        if (frames_to_write > NATIVE_READ_FRAMES) frames_to_write = NATIVE_READ_FRAMES;
+        if (ma_pcm_rb_acquire_write(&player.ring, &frames_to_write, &write_buffer)
+                != MA_SUCCESS || frames_to_write == 0) {
+            write_status(L"ERROR Could not acquire stream buffer");
             exit_code = 67;
             goto cleanup;
         }
-        ++sequence;
-        if (sequence == 1
-            && !native_chunk_player_init(&player, prefix, STREAM_SAMPLE_RATE)) {
-            write_status(L"ERROR Native audio output initialization failed");
-            exit_code = 68;
+        result = ma_decoder_read_pcm_frames(
+            &decoder, write_buffer, frames_to_write, &frames_read);
+        if (frames_read > 0) {
+            ma_pcm_rb_commit_write(&player.ring, (ma_uint32)frames_read);
+        } else {
+            ma_pcm_rb_commit_write(&player.ring, 0);
+        }
+        if (result != MA_SUCCESS && result != MA_AT_END) {
+            write_status(L"ERROR Live stream decoding failed");
+            exit_code = 65;
             goto cleanup;
         }
-        if (sequence < STREAM_READY_CHUNKS) {
-            _snwprintf(status, (sizeof(status) / sizeof(status[0])) - 1,
-                L"BUFFERING Live stream %u / %u", sequence,
-                (unsigned int)STREAM_READY_CHUNKS);
-            status[(sizeof(status) / sizeof(status[0])) - 1] = L'\0';
-            write_status(status);
-        } else if (sequence == STREAM_READY_CHUNKS) {
-            _snwprintf(status, (sizeof(status) / sizeof(status[0])) - 1,
-                L"STREAM_PCM %ls\t%u\t%u\t%u", prefix,
-                (unsigned int)STREAM_SAMPLE_RATE,
-                (unsigned int)STREAM_CHANNELS,
-                (unsigned int)STREAM_CHUNK_SECONDS);
-            status[(sizeof(status) / sizeof(status[0])) - 1] = L'\0';
-            write_status(status);
+        if (result == MA_AT_END || frames_read == 0) {
+            write_status(L"ERROR Live stream ended");
+            exit_code = 66;
+            goto cleanup;
+        }
+        if (!ready && ma_pcm_rb_available_read(&player.ring)
+                >= STREAM_SAMPLE_RATE * STREAM_READY_SECONDS) {
+            ready = 1;
+            write_status(L"STREAM_READY 48000\t1");
         }
     }
 
 cleanup:
-    native_chunk_player_uninit(&player);
-    free(samples);
-    if (prefix[0] != L'\0') delete_pcm_chunks(prefix, sequence);
+    native_stream_player_uninit(&player);
     ma_decoder_uninit(&decoder);
     close_http_stream(&stream);
     CloseHandle(stop_event);
@@ -1257,402 +637,93 @@ cleanup:
     return exit_code;
 }
 
-static int run_accuradio_pcm(const wchar_t* url, const wchar_t* watched_process)
+static int run_launch_request(void)
 {
-    HANDLE stop_event;
-    wchar_t channel[25];
-    wchar_t temp_path[MAX_PATH];
-    wchar_t prefix[MAX_PATH];
-    wchar_t source_path[MAX_PATH];
-    wchar_t decoded_path[MAX_PATH];
-    wchar_t status[MAX_PATH + 96];
-    wchar_t tracks[ACCURADIO_MAX_TRACKS][4096];
-    char titles[ACCURADIO_MAX_TRACKS][512];
-    unsigned char* chunk = NULL;
-    size_t chunk_size = 0;
-    size_t chunk_used = 0;
-    UINT32 stream_rate = 0;
-    UINT32 stream_channels = 0;
-    unsigned int sequence = 0;
-    int exit_code = 0;
-    NativeChunkPlayer player;
-
-    prefix[0] = L'\0';
-    memset(&player, 0, sizeof(player));
-    if (!extract_accuradio_channel(url, channel)) {
-        write_status(L"ERROR Invalid AccuRadio channel URL");
-        return 70;
-    }
-    stop_event = create_stop_event();
-    if (stop_event == NULL) {
-        write_status(L"ERROR Could not acquire bridge event");
-        return 71;
-    }
-    if (GetTempPathW(MAX_PATH, temp_path) == 0 || wcslen(temp_path) + 64 >= MAX_PATH) {
-        write_status(L"ERROR AccuRadio temporary path is unavailable");
-        CloseHandle(stop_event);
-        return 72;
-    }
-    _snwprintf(prefix, MAX_PATH - 1, L"%lsrv-there-now-stream-%lu",
-        temp_path, (unsigned long)GetCurrentProcessId());
-    prefix[MAX_PATH - 1] = L'\0';
-    _snwprintf(source_path, MAX_PATH - 1, L"%ls-accuradio.m4a", prefix);
-    source_path[MAX_PATH - 1] = L'\0';
-    _snwprintf(decoded_path, MAX_PATH - 1, L"%ls-accuradio.pcm", prefix);
-    decoded_path[MAX_PATH - 1] = L'\0';
-
-    for (;;) {
-        int track_count = 0;
-        int track_index;
-        write_status(L"OPENING AccuRadio playlist");
-        if (!resolve_accuradio_tracks(channel, tracks, titles, &track_count)) {
-            write_status(L"ERROR Could not resolve AccuRadio playlist");
-            exit_code = 73;
-            break;
-        }
-        for (track_index = 0; track_index < track_count; ++track_index) {
-            UINT32 sample_rate = 0;
-            UINT32 channels = 0;
-            double duration = 0.0;
-            FILE* decoded;
-
-            if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-                || !process_is_running(watched_process)) goto cleanup;
-            write_now_playing((const unsigned char*)titles[track_index],
-                strlen(titles[track_index]));
-            write_status(sequence < STREAM_READY_CHUNKS
-                ? L"BUFFERING AccuRadio tracks"
-                : L"PLAYING AccuRadio track queue");
-            DeleteFileW(source_path);
-            if (!download_http_file(tracks[track_index], source_path)) {
-                continue;
-            }
-            if (!mf_decode_audio_file_to_pcm(source_path, decoded_path, stop_event,
-                    watched_process, &sample_rate, &channels, &duration, write_status)) {
-                DeleteFileW(source_path);
-                continue;
-            }
-            DeleteFileW(source_path);
-            if (stream_rate == 0) {
-                stream_rate = sample_rate;
-                stream_channels = channels;
-                chunk_size = (size_t)stream_rate * stream_channels
-                    * sizeof(int16_t) * STREAM_CHUNK_SECONDS;
-                chunk = (unsigned char*)malloc(chunk_size);
-                if (chunk == NULL) {
-                    write_status(L"ERROR Could not allocate AccuRadio PCM buffer");
-                    exit_code = 74;
-                    goto cleanup;
-                }
-            } else if (sample_rate != stream_rate || channels != stream_channels) {
-                DeleteFileW(decoded_path);
-                continue;
-            }
-            decoded = _wfopen(decoded_path, L"rb");
-            if (decoded == NULL) continue;
-            while (!feof(decoded)) {
-                size_t amount = fread(chunk + chunk_used, 1, chunk_size - chunk_used, decoded);
-                chunk_used += amount;
-                if (chunk_used < chunk_size) {
-                    if (ferror(decoded)) break;
-                    continue;
-                }
-                if (sequence >= STREAM_RETAIN_CHUNKS) {
-                    unsigned int oldest = sequence - STREAM_RETAIN_CHUNKS;
-                    while (pcm_chunk_exists(prefix, oldest)) {
-                        if (WaitForSingleObject(stop_event, 50) == WAIT_OBJECT_0
-                            || !process_is_running(watched_process)) {
-                            fclose(decoded);
-                            goto cleanup;
-                        }
-                    }
-                }
-                if (!write_pcm_chunk(prefix, sequence, (const int16_t*)chunk, chunk_size)) {
-                    fclose(decoded);
-                    write_status(L"ERROR Could not write AccuRadio stream buffer");
-                    exit_code = 75;
-                    goto cleanup;
-                }
-                ++sequence;
-                if (sequence == 1
-                    && !native_chunk_player_init(&player, prefix, stream_rate)) {
-                    fclose(decoded);
-                    write_status(L"ERROR Native audio output initialization failed");
-                    exit_code = 76;
-                    goto cleanup;
-                }
-                chunk_used = 0;
-                if (sequence < STREAM_READY_CHUNKS) {
-                    _snwprintf(status, (sizeof(status) / sizeof(status[0])) - 1,
-                        L"BUFFERING AccuRadio %u / %u", sequence,
-                        (unsigned int)STREAM_READY_CHUNKS);
-                    status[(sizeof(status) / sizeof(status[0])) - 1] = L'\0';
-                    write_status(status);
-                } else if (sequence == STREAM_READY_CHUNKS) {
-                    _snwprintf(status, (sizeof(status) / sizeof(status[0])) - 1,
-                        L"STREAM_PCM %ls\t%u\t%u\t%u", prefix,
-                        (unsigned int)stream_rate, (unsigned int)stream_channels,
-                        (unsigned int)STREAM_CHUNK_SECONDS);
-                    status[(sizeof(status) / sizeof(status[0])) - 1] = L'\0';
-                    write_status(status);
-                }
-            }
-            fclose(decoded);
-            DeleteFileW(decoded_path);
-        }
-    }
-
-cleanup:
-    native_chunk_player_uninit(&player);
-    free(chunk);
-    DeleteFileW(source_path);
-    DeleteFileW(decoded_path);
-    if (prefix[0] != L'\0') delete_pcm_chunks(prefix, sequence);
-    CloseHandle(stop_event);
-    if (exit_code == 0) write_status(L"OFF");
-    return exit_code;
-}
-
-static int run_youtube_prepare(const wchar_t* watched_process)
-{
-    HANDLE stop_event;
-    wchar_t audio_path[MAX_PATH];
-    wchar_t pcm_path[MAX_PATH];
-    wchar_t prefix[MAX_PATH];
-    wchar_t ready_status[MAX_PATH + 96];
-    UINT32 sample_rate = 0;
-    UINT32 channels = 0;
-    double duration_seconds = 0.0;
-    unsigned char* chunk = NULL;
-    size_t chunk_size = 0;
-    unsigned int sequence = 0;
-    int exit_code = 0;
-    FILE* decoded = NULL;
-    NativeChunkPlayer player;
-
-    audio_path[0] = L'\0';
-    pcm_path[0] = L'\0';
-    prefix[0] = L'\0';
-    memset(&player, 0, sizeof(player));
-
-    write_status(L"OPENING YouTube helper");
-    stop_event = create_stop_event();
-    if (stop_event == NULL) {
-        write_status(L"ERROR Could not acquire bridge event");
-        return 50;
-    }
-    if (!youtube_download_audio(g_url_path, audio_path,
-            sizeof(audio_path) / sizeof(audio_path[0]), stop_event,
-            watched_process, write_status)) {
-        if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-            || !process_is_running(watched_process)) {
-            write_status(L"OFF");
-        }
-        exit_code = 51;
-        goto cleanup;
-    }
-    if (GetTempPathW(MAX_PATH, pcm_path) == 0
-        || wcslen(pcm_path) + wcslen(L"rv-there-now-youtube.pcm") + 1 >= MAX_PATH) {
-        write_status(L"ERROR Could not create decoded audio path");
-        exit_code = 53;
-        goto cleanup;
-    }
-    wcscat(pcm_path, L"rv-there-now-youtube.pcm");
-    if (!mf_decode_audio_file_to_pcm(audio_path, pcm_path, stop_event,
-            watched_process, &sample_rate, &channels, &duration_seconds,
-            write_status)) {
-        exit_code = 54;
-        goto cleanup;
-    }
-    DeleteFileW(audio_path);
-    audio_path[0] = L'\0';
-    if (channels != STREAM_CHANNELS || sample_rate == 0) {
-        write_status(L"ERROR YouTube decoder returned unsupported PCM");
-        exit_code = 55;
-        goto cleanup;
-    }
-    _snwprintf(prefix, MAX_PATH - 1, L"%lsrv-there-now-stream-%lu",
-        pcm_path, (unsigned long)GetCurrentProcessId());
-    prefix[MAX_PATH - 1] = L'\0';
-    chunk_size = (size_t)sample_rate * channels * sizeof(int16_t)
-        * STREAM_CHUNK_SECONDS;
-    chunk = (unsigned char*)malloc(chunk_size);
-    if (chunk == NULL) {
-        write_status(L"ERROR Could not allocate YouTube PCM buffer");
-        exit_code = 56;
-        goto cleanup;
-    }
-    decoded = _wfopen(pcm_path, L"rb");
-    if (decoded == NULL) {
-        write_status(L"ERROR Could not open decoded YouTube audio");
-        exit_code = 57;
-        goto cleanup;
-    }
-    for (;;) {
-        size_t amount = fread(chunk, 1, chunk_size, decoded);
-        if (amount == 0) break;
-        if (!write_pcm_chunk(prefix, sequence, (const int16_t*)chunk, amount)) {
-            write_status(L"ERROR Could not stage YouTube audio");
-            exit_code = 58;
-            goto cleanup;
-        }
-        ++sequence;
-        if (amount < chunk_size) break;
-    }
-    fclose(decoded);
-    decoded = NULL;
-    DeleteFileW(pcm_path);
-    pcm_path[0] = L'\0';
-    if (sequence == 0) {
-        write_status(L"ERROR Decoded YouTube audio was empty");
-        exit_code = 59;
-        goto cleanup;
-    }
-    if (!native_chunk_player_init(&player, prefix, sample_rate)) {
-        write_status(L"ERROR Native audio output initialization failed");
-        exit_code = 60;
-        goto cleanup;
-    }
-    _snwprintf(ready_status, (sizeof(ready_status) / sizeof(ready_status[0])) - 1,
-        L"STREAM_PCM %ls\t%u\t%u\t%u", prefix,
-        (unsigned int)sample_rate, (unsigned int)channels,
-        (unsigned int)STREAM_CHUNK_SECONDS);
-    ready_status[(sizeof(ready_status) / sizeof(ready_status[0])) - 1] = L'\0';
-    write_status(ready_status);
-
-    while (WaitForSingleObject(stop_event, 100) != WAIT_OBJECT_0
-        && process_is_running(watched_process)) {
-    }
-
-cleanup:
-    native_chunk_player_uninit(&player);
-    if (decoded != NULL) fclose(decoded);
-    free(chunk);
-    if (audio_path[0] != L'\0') DeleteFileW(audio_path);
-    if (pcm_path[0] != L'\0') DeleteFileW(pcm_path);
-    if (prefix[0] != L'\0') delete_pcm_chunks(prefix, sequence);
-    CloseHandle(stop_event);
-    if (exit_code == 0) write_status(L"OFF");
-    return exit_code;
-}
-
-static int run_youtube_bridge(float volume, const wchar_t* watched_process)
-{
-    HANDLE stop_event;
-    wchar_t audio_path[MAX_PATH];
-    int result;
-
-    write_status(L"OPENING YouTube helper");
-    stop_event = create_stop_event();
-    if (stop_event == NULL) {
-        write_status(L"ERROR Could not acquire bridge event");
-        return 30;
-    }
-    if (!youtube_download_audio(g_url_path, audio_path,
-            sizeof(audio_path) / sizeof(audio_path[0]), stop_event,
-            watched_process, write_status)) {
-        if (WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0
-            || !process_is_running(watched_process)) {
-            write_status(L"OFF");
-        }
-        CloseHandle(stop_event);
-        return 31;
-    }
-
-    result = mf_play_audio_file(audio_path, volume, stop_event,
-        watched_process, write_status);
-    DeleteFileW(audio_path);
-    CloseHandle(stop_event);
-    return result;
-}
-
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show_command)
-{
-    int argument_count = 0;
-    wchar_t** arguments;
-    float volume = 0.5f;
-    const wchar_t* watched_process = NULL;
-    const wchar_t* operation;
-    const wchar_t* url;
     wchar_t url_from_file[4096];
-    wchar_t launch_mode[16];
-    int index;
-    int result;
-    (void)instance;
-    (void)previous;
-    (void)command_line;
-    (void)show_command;
 
     initialize_temp_paths();
     spatial_audio_initialize();
-    arguments = CommandLineToArgvW(GetCommandLineW(), &argument_count);
-    if (arguments == NULL) {
-        write_status(L"ERROR Could not read radio helper arguments");
-        return 1;
-    }
-    if (argument_count < 2) {
-        if (!read_launch_mode(launch_mode)) {
-            write_status(L"ERROR Missing radio launch request");
-            LocalFree(arguments);
-            return 1;
-        }
-        operation = launch_mode;
-        watched_process = L"Ride-Win64-Shipping.exe";
-    } else {
-        operation = arguments[1];
-    }
-    if (wcscmp(operation, L"--stop") == 0) {
-        result = signal_existing_bridge() ? 0 : 1;
-        LocalFree(arguments);
-        return result;
-    }
-    DeleteFileW(g_confirm_path);
     DeleteFileW(g_now_playing_path);
-    if (wcscmp(operation, L"--url-file") == 0
-        || wcscmp(operation, L"--relay") == 0
-        || wcscmp(operation, L"--stream-pcm") == 0
-        || wcscmp(operation, L"--prepare-youtube") == 0) {
-        if (!read_url_file(url_from_file, sizeof(url_from_file) / sizeof(url_from_file[0]))) {
-            write_status(L"ERROR Invalid or missing stream URL");
-            LocalFree(arguments);
-            return 1;
-        }
-        url = url_from_file;
-    } else if (argument_count >= 2) {
-        url = arguments[1];
-    } else {
-        write_status(L"ERROR Invalid radio launch request");
-        LocalFree(arguments);
+    if (!read_url_file(url_from_file, sizeof(url_from_file) / sizeof(url_from_file[0]))) {
+        write_status(L"ERROR Invalid or missing stream URL");
         return 1;
     }
-    for (index = 2; index + 1 < argument_count; index += 2) {
-        if (wcscmp(arguments[index], L"--volume") == 0) {
-            int percent = _wtoi(arguments[index + 1]);
-            if (percent >= 0 && percent <= 100) {
-                volume = (float)percent / 100.0f;
-            }
-        } else if (wcscmp(arguments[index], L"--watch") == 0) {
-            watched_process = arguments[index + 1];
+    return run_stream_pcm(url_from_file);
+}
+
+static DWORD WINAPI bridge_worker(void* parameter)
+{
+    HMODULE worker_module = (HMODULE)parameter;
+    DWORD result = (DWORD)run_launch_request();
+    FreeLibraryAndExitThread(worker_module, result);
+    return result;
+}
+
+__declspec(dllexport) int __cdecl rvtn_play(void* lua_state)
+{
+    (void)lua_state;
+    signal_named_event(PLAY_EVENT_NAME);
+    return 0;
+}
+
+__declspec(dllexport) int __cdecl rvtn_stop(void* lua_state)
+{
+    (void)lua_state;
+    signal_named_event(STOP_EVENT_NAME);
+    return 0;
+}
+
+__declspec(dllexport) int __cdecl rvtn_launch(void* lua_state)
+{
+    wchar_t module_path[MAX_PATH];
+    HMODULE worker_module;
+    DWORD wait_result;
+    (void)lua_state;
+
+    initialize_temp_paths();
+    AcquireSRWLockExclusive(&g_worker_lock);
+    if (g_worker_thread != NULL) {
+        wait_result = WaitForSingleObject(g_worker_thread, 0);
+        if (wait_result == WAIT_TIMEOUT) {
+            signal_existing_bridge();
+            wait_result = WaitForSingleObject(g_worker_thread, 3000);
         }
+        if (wait_result == WAIT_TIMEOUT) {
+            write_status(L"ERROR Previous radio worker did not stop");
+            ReleaseSRWLockExclusive(&g_worker_lock);
+            return 0;
+        }
+        CloseHandle(g_worker_thread);
+        g_worker_thread = NULL;
     }
 
-    if (wcscmp(operation, L"--prepare-youtube") == 0) {
-        result = youtube_is_url(url)
-            ? run_youtube_prepare(watched_process)
-            : 52;
-        if (result == 52) write_status(L"ERROR Source is not a YouTube URL");
-    } else if (wcscmp(operation, L"--relay") == 0) {
-        result = run_relay(url, watched_process);
-    } else if (wcscmp(operation, L"--stream-pcm") == 0) {
-        wchar_t accuradio_channel[25];
-        result = extract_accuradio_channel(url, accuradio_channel)
-            ? run_accuradio_pcm(url, watched_process)
-            : run_stream_pcm(url, watched_process);
-    } else if (youtube_is_url(url) && wcscmp(operation, L"--url-file") == 0) {
-        result = run_youtube_bridge(volume, watched_process);
-    } else {
-        result = run_bridge(url, volume, watched_process);
+    if (GetModuleFileNameW(g_module, module_path, MAX_PATH) == 0) {
+        write_status(L"ERROR Could not retain radio bridge DLL");
+        ReleaseSRWLockExclusive(&g_worker_lock);
+        return 0;
     }
-    LocalFree(arguments);
-    return result;
+    module_path[MAX_PATH - 1] = L'\0';
+    worker_module = LoadLibraryW(module_path);
+    if (worker_module == NULL) {
+        write_status(L"ERROR Could not retain radio bridge DLL");
+        ReleaseSRWLockExclusive(&g_worker_lock);
+        return 0;
+    }
+    g_worker_thread = CreateThread(NULL, 0, bridge_worker, worker_module, 0, NULL);
+    if (g_worker_thread == NULL) {
+        FreeLibrary(worker_module);
+        write_status(L"ERROR Could not start radio bridge thread");
+    }
+    ReleaseSRWLockExclusive(&g_worker_lock);
+    return 0;
+}
+
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
+{
+    (void)reserved;
+    if (reason == DLL_PROCESS_ATTACH) {
+        g_module = instance;
+        DisableThreadLibraryCalls(instance);
+    }
+    return TRUE;
 }

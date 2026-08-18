@@ -2,6 +2,10 @@
 
 RV There Now adds a host-side player-cap menu to **RV There Yet?**. Press **F6** in game, choose a cap from 4 to 24, and apply it before creating a lobby. Only the host needs the mod for the expanded cap; every player who should hear synchronized internet radio needs it installed.
 
+## Support SomaFM
+
+Internet radio in RV There Now is powered by [SomaFM](https://somafm.com/). Thank you to SomaFM for providing an amazing independent, listener-supported radio service. If you enjoy these stations, please [donate directly to SomaFM](https://somafm.com/support/) and help keep them on the air.
+
 The game is designed for four players. Eight is the recommended expanded cap; larger sessions may expose gameplay, UI, networking, and performance problems.
 
 ## In-game menu
@@ -16,17 +20,15 @@ The game is designed for four players. Eight is the recommended expanded cap; la
 - The optional compact HUD shows the live player count, applied cap, and average remote ping.
 - Selecting a cap of four and applying it restores the vanilla lobby size.
 
-The **Internet Radio** row plays the selected station through the bundled radio bridge. The 12-station catalog includes AccuRadio Summer Hits '76, seven music stations, and four talk choices: KONA 610 AM, WNYC, RNZ National, and BBC World Service. KONA is a current Coast to Coast AM affiliate; programming follows the station's live schedule.
+The **Internet Radio** row plays one of 17 SomaFM music stations through the bundled radio bridge: Groove Salad, Drone Zone, Secret Agent, Left Coast 70s, Underground 80s, Indie Pop Rocks, DEF CON Radio, Thistle Radio, Vaporwaves, The In-Sound, Deep Space One, Metal Detector, Folk Forward, Tiki Time, 7 Inch Soul, Dub Step Beyond, and Boot Liquor. The catalog uses SomaFM's published permanent MP3 stream links; it does not scrape private service APIs or download individual tracks. Playback rejects non-SomaFM URLs received through lobby metadata.
 
-Live MP3 stations are decoded continuously into one-second mono PCM chunks. The bundled Windows bridge owns the audio device and consumes those chunks continuously after Lua releases the synchronized start gate. The menu reports playback only after the device callback consumes nonzero decoded samples. ICY metadata and AccuRadio playlist data feed a small current-song or current-program label fixed in the lower-right corner.
+Live MP3 stations are decoded continuously into an eight-second in-memory ring buffer. The bundled Windows bridge owns the audio device, and its real-time callback performs no file I/O. Lua releases the synchronized start gate through a direct DLL export after two seconds are buffered. The menu reports playback only after the device callback consumes nonzero decoded samples. ICY metadata feeds a small current-song label fixed in the lower-right corner.
 
-AccuRadio is resolved through its playlist endpoint. The bundled QuickJS runtime parses the playlist, and the bridge downloads and decodes its M4A tracks into the same continuous PCM queue. YouTube sources are downloaded and decoded locally through the bundled tools, then staged into that queue. No machine-installed media tools or runtimes are required.
+The host publishes the source, shared start time, and radio volume as atomic Steam lobby events, with Steam rich presence used only when a lobby is unavailable. One consolidated game-thread scheduler polls Steam state at 500 ms intervals during gameplay, checks startup and positional state at 100 ms while needed, and refreshes the roster once per second. Every modded player resolves the source locally. Lua sends the bridge per-client distance and stereo pan computed from the RV and listener positions. The RV radio's physical Play, Stop, volume, previous, and next buttons remain visible and control internet radio directly; vanilla cassettes are hidden and their finite tape index is reset after input. Previous and next wrap around the station catalog. Only the host can stop or change an active synchronized station, so clients cannot silence their local copy independently. Every player who should hear internet radio must install the mod.
 
-The host publishes the source, shared start time, and radio volume through Steam lobby metadata, with Steam rich presence as a fallback for sessions that do not expose their lobby. Every modded player resolves the source locally. Lua sends the bridge per-client distance and stereo pan computed from the RV and listener positions. The RV radio's physical Play, Stop, volume, previous, and next buttons remain visible and control internet radio directly; vanilla cassettes are hidden and their finite tape index is reset after input. Previous and next wrap around the station catalog. Only the host can stop or change an active synchronized station, so clients cannot silence their local copy independently. Every player who should hear internet radio must install the mod.
+UE4SS loads the bundled radio bridge DLL directly. Its audio worker runs on a background thread inside the game process, so there is no radio executable, command prompt, or desktop file association. Lua stops the worker as soon as the RV world unloads, including when returning to the main menu.
 
-UE4SS loads the bundled launcher DLL, which starts the bridge as a hidden Windows process in the game's own Windows or Proton environment. It does not open a console or invoke a desktop file association. The bridge watches the game process, and Lua stops it as soon as the RV world unloads, including when returning to the main menu.
-
-Antivirus software can quarantine unsigned community-mod binaries. Norton may terminate the game when it blocks `rv-radio-launcher.dll`; use only the file from the official release, verify the release checksum, and report or allow that verified file. Disabling antivirus protection globally is not recommended.
+Antivirus software can quarantine unsigned community-mod binaries. Norton may terminate the game when it blocks `rv-radio-bridge.dll`; use only the file from the official release, verify the release checksum, and report or allow that verified file. Disabling antivirus protection globally is not recommended.
 
 Applying a cap writes Unreal's `Game.ini` setting and updates the `GameSession` class default. Create a new lobby after applying it. The first change also creates a one-time backup beside `Game.ini`.
 
@@ -40,7 +42,7 @@ Copyright (C) 2026 Rogue-Factor.
 
 Unless otherwise noted, the original source code and assets in this repository are licensed under the [GNU General Public License version 3 or later](LICENSE).
 
-Bundled third-party components are not relicensed. They remain available under their respective terms in `mod/licenses` and `bridge/vendor`.
+Bundled miniaudio code is not relicensed. It remains available under its respective terms in `mod/licenses` and `bridge/vendor`.
 
 ## Install with a mod manager
 
