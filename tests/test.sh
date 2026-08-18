@@ -127,8 +127,13 @@ grep -Fq 'controls.NextTapeButton' "$ROOT/mod/scripts/main.lua" \
     || fail 'physical next button is not mapped to radio stations'
 grep -Fq 'controls.PreviousTapeButton' "$ROOT/mod/scripts/main.lua" \
     || fail 'physical previous button is not mapped to radio stations'
-grep -Fq 'tape_player[name] = nil' "$ROOT/mod/scripts/main.lua" \
-    || fail 'vanilla cassette controls are not disabled'
+if grep -Fq 'tape_player[name] = nil' "$ROOT/mod/scripts/main.lua"; then
+  fail 'physical radio button component references must remain intact'
+fi
+grep -Fq 'tape_player.CurrentTapeIndex = 0' "$ROOT/mod/scripts/main.lua" \
+    || fail 'vanilla cassette index is not reset after radio input'
+grep -Fq 'same_unreal_object(character, local_character)' "$ROOT/mod/scripts/main.lua" \
+    || fail 'physical radio controls are not restricted to the listen host'
 if grep -Eq 'os\.execute|start ""' "$ROOT/mod/scripts/radio.lua"; then
   fail 'radio helper still launches through a focus-stealing command shell'
 fi

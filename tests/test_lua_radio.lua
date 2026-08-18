@@ -169,6 +169,19 @@ assert(not unsynchronized:start())
 assert(unsynchronized.state == "UNAVAILABLE")
 assert(unsynchronized.detail == "Steam lobby metadata unavailable")
 
+local client_stop_path = os.tmpname() .. ".stop"
+local client_radio = Radio.new({
+    get_player_controller = function() return controller end,
+    is_host = false,
+    stop_path = client_stop_path,
+    sync = sync,
+})
+client_radio.state = "PLAYING"
+assert(not client_radio:stop())
+assert(client_radio.state == "PLAYING")
+assert(client_radio.detail == "Only the host can stop the RV radio")
+assert(io.open(client_stop_path, "rb") == nil)
+
 local solo_unsynchronized = Radio.new({
     get_player_controller = function() return controller end,
     is_host = true,

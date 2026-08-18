@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.16.1
+
+- Keep every physical radio button visible while binding it to internet-radio behavior.
+- Reset cassette playback state after physical input without clearing the button component references.
+- Prevent clients from controlling the synchronized station through either their menu or the physical RV buttons.
+
 ## 0.16.0
 
 - Replace the vanilla cassette Play, Stop, volume, next, and previous actions with internet-radio-only controls.

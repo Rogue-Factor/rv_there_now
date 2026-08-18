@@ -486,20 +486,28 @@ function Radio.new(options)
     end
 
     function self:stop(reason)
-        if local_is_host() and self.sync then
+        if not local_is_host() then
+            self.detail = "Only the host can stop the RV radio"
+            return false, self.detail
+        end
+        if self.sync then
             local _, err = self.sync:publish_stop()
             if err then self.log("Could not publish radio stop: " .. tostring(err)) end
         end
         close_local(reason)
         self.log(reason or "Internet radio stopped")
+        return true
     end
 
     function self:toggle()
         if self:is_active() then
-            self:stop()
-            return false
+            return self:stop()
         end
         return self:start()
+    end
+
+    function self:can_control()
+        return local_is_host()
     end
 
     function self:poll_sync()

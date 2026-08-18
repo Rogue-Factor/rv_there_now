@@ -1,5 +1,5 @@
 local MOD_NAME = "RVThereNow"
-local MOD_VERSION = "0.16.0"
+local MOD_VERSION = "0.16.1"
 local MIN_PLAYERS = 4
 local MAX_PLAYERS = 24
 local PLAYER_ROWS = 8
@@ -491,7 +491,7 @@ end
 
 local select_station
 
-local function neutralize_tape_players()
+local function discover_tape_players()
     local ok, tape_players = pcall(FindAllOf, "BP_TapePlayer_C")
     if not ok or not tape_players then return end
     for _, tape_player in ipairs(tape_players) do
@@ -516,31 +516,16 @@ local function neutralize_tape_players()
                 if not captured then complete = false end
             end
             if complete then
-                local disabled = true
-                for name in pairs(controls) do
-                    local remaining = nil
-                    local cleared = pcall(function()
-                        tape_player[name] = nil
-                        remaining = tape_player[name]
-                    end)
-                    disabled = disabled and cleared and not is_valid(remaining)
-                end
-                if disabled then
-                    pcall(function()
-                        local cassette = tape_player.SM_CassetteTape_Austin_01
-                        if is_valid(cassette) then
-                            cassette:SetVisibility(false, true)
-                            cassette:SetHiddenInGame(true, true)
-                        end
-                    end)
-                    controls.tape_player = tape_player
-                    State.tape_controls[address] = controls
-                    log("Cassette controls replaced with internet-radio controls")
-                else
-                    for name, control in pairs(controls) do
-                        pcall(function() tape_player[name] = control end)
+                pcall(function()
+                    local cassette = tape_player.SM_CassetteTape_Austin_01
+                    if is_valid(cassette) then
+                        cassette:SetVisibility(false, true)
+                        cassette:SetHiddenInGame(true, true)
                     end
-                end
+                end)
+                controls.tape_player = tape_player
+                State.tape_controls[address] = controls
+                log("Physical RV buttons bound to internet-radio controls")
             end
         end
     end
@@ -550,40 +535,67 @@ local function register_tape_control_hooks()
     pcall(function()
         LoadAsset("/Game/Ride/Vehicle/Blueprints/BP_TapePlayer")
     end)
-    neutralize_tape_players()
+    discover_tape_players()
     if State.tape_hooks_attempted then return end
     State.tape_hooks_attempted = true
 
     local class_path = "/Game/Ride/Vehicle/Blueprints/BP_TapePlayer.BP_TapePlayer_C:"
-    local callback = function(context, _, hit_result)
+    local callback = function(context, player_character, hit_result)
         local tape_player = unwrap(context)
         local authority = false
         pcall(function() authority = tape_player:HasAuthority() == true end)
-        if not authority then return end
         local controls = State.tape_controls[unreal_address(tape_player)]
         local component = resolve_hit_component(hit_result)
         if not controls or not is_valid(component) then return end
 
-        local volume_changed = false
+        local control = nil
         if same_unreal_object(component, controls.NextTapeButton) then
-            select_station(State.station_index + 1)
+            control = "next"
         elseif same_unreal_object(component, controls.PreviousTapeButton) then
-            select_station(State.station_index - 1)
+            control = "previous"
         elseif same_unreal_object(component, controls.PlayButton) then
-            if not InternetRadio:is_active() then InternetRadio:start() end
+            control = "play"
         elseif same_unreal_object(component, controls.StopButton) then
-            if InternetRadio:is_active() then InternetRadio:stop("Stopped at RV radio") end
+            control = "stop"
         elseif same_unreal_object(component, controls.UpVolumeButton) then
+            control = "volume_up"
+        elseif same_unreal_object(component, controls.DownVolumeButton) then
+            control = "volume_down"
+        end
+        if not control then return end
+        pcall(function()
+            tape_player.IsPlaying = false
+            tape_player.CurrentTapeIndex = 0
+            if is_valid(tape_player.Audio) then tape_player.Audio:Stop() end
+        end)
+
+        local character = unwrap(player_character)
+        local local_character = nil
+        pcall(function()
+            local controller = UEHelpers.GetPlayerController()
+            if is_valid(controller) then local_character = controller:K2_GetPawn() end
+        end)
+        if not authority or not same_unreal_object(character, local_character) then return end
+
+        local volume_changed = false
+        if control == "next" then
+            select_station(State.station_index + 1)
+        elseif control == "previous" then
+            select_station(State.station_index - 1)
+        elseif control == "play" then
+            if not InternetRadio:is_active() then InternetRadio:start() end
+        elseif control == "stop" then
+            if InternetRadio:is_active() then InternetRadio:stop("Stopped at RV radio") end
+        elseif control == "volume_up" then
             local volume = InternetRadio:adjust_volume(0.1)
             State.status = string.format("Radio volume %d%%", math.floor(volume * 100 + 0.5))
             volume_changed = true
-        elseif same_unreal_object(component, controls.DownVolumeButton) then
+        elseif control == "volume_down" then
             local volume = InternetRadio:adjust_volume(-0.1)
             State.status = string.format("Radio volume %d%%", math.floor(volume * 100 + 0.5))
             volume_changed = true
         end
-        if not volume_changed and (same_unreal_object(component, controls.PlayButton)
-            or same_unreal_object(component, controls.StopButton)) then
+        if not volume_changed and (control == "play" or control == "stop") then
             State.status = InternetRadio:status_text()
         end
         refresh_ui()
@@ -595,7 +607,7 @@ local function register_tape_control_hooks()
             pre = pre_id,
             post = post_id,
         })
-        log("Registered cassette-free RV radio controls")
+        log("Registered physical RV internet-radio controls")
     else
         State.tape_hooks_attempted = false
     end
@@ -769,6 +781,10 @@ local function move_selection(delta)
 end
 
 select_station = function(index)
+    if InternetRadio:is_active() and not InternetRadio:can_control() then
+        State.status = "Only the host can change the RV radio"
+        return false
+    end
     index = ((index - 1) % #RADIO_STATIONS) + 1
     local restart = InternetRadio:is_active()
     if restart then
