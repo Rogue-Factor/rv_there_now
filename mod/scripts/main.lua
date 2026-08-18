@@ -1,5 +1,5 @@
 local MOD_NAME = "RVThereNow"
-local MOD_VERSION = "0.15.0"
+local MOD_VERSION = "0.15.1"
 local MIN_PLAYERS = 4
 local MAX_PLAYERS = 24
 local PLAYER_ROWS = 8

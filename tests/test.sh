@@ -146,5 +146,15 @@ grep -Fq 'JSON.parse' "$ROOT/mod/bin/accuradio-resolver.js" \
     || fail 'yt-dlp third-party licenses are missing'
 [[ -f "$ROOT/mod/licenses/LICENSE.quickjs-ng" ]] || fail 'QuickJS license is missing'
 [[ -f "$ROOT/LICENSE" ]] || fail 'project GPL license is missing'
+[[ -f "$ROOT/standalone/UE4SS-settings.ini" ]] || fail 'standalone UE4SS settings are missing'
+grep -Fq 'MajorVersion = 5' "$ROOT/standalone/UE4SS-settings.ini" \
+    || fail 'standalone UE4SS major version override is missing'
+grep -Fq 'MinorVersion = 6' "$ROOT/standalone/UE4SS-settings.ini" \
+    || fail 'standalone UE4SS minor version override is missing'
+grep -Fq 'HookLoadMap = 0' "$ROOT/standalone/UE4SS-settings.ini" \
+    || fail 'standalone UE4SS must disable the failing LoadMap hook'
+grep -Fq '8deaf2a7246370f4e30f65af37645cdef481a28cb353d7285c3a62576bcba853' \
+    "$ROOT/scripts/package-standalone.sh" \
+    || fail 'standalone UE4SS dependency is not checksum-pinned'
 
 printf 'All tests passed.\n'

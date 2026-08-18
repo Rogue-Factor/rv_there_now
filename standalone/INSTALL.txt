@@ -1,0 +1,56 @@
+RV There Now - Standalone Installation
+======================================
+
+This archive includes RV There Now and the tested UE4SS build. Do not use
+this archive with r2modman or Thunderstore Mod Manager; use the regular
+RVThereNow zip there instead.
+
+Install
+-------
+
+1. Close RV There Yet?.
+2. In Steam, right-click RV There Yet? and choose Manage > Browse local files.
+3. Extract this archive into that folder, which already contains the Ride
+   directory. Allow folders to merge and files to be replaced.
+4. Verify these files exist:
+
+   Ride\Binaries\Win64\dwmapi.dll
+   Ride\Binaries\Win64\UE4SS.dll
+   Ride\Binaries\Win64\Mods\RVThereNow\Scripts\main.lua
+
+5. Start the game normally. Press F6 to open the dashboard.
+
+Windows Defender may warn about UE4SS or the bundled radio helper because
+they load code into the game process. Download this archive only from the
+official Rogue-Factor/rv_there_now GitHub release and verify its SHA-256 value.
+
+Existing UE4SS installations
+----------------------------
+
+Back up an existing UE4SS installation before extracting this archive. The
+standalone package contains Ride-specific UE4SS settings and replaces the
+UE4SS settings file. Users who already manage UE4SS should install the regular
+package's mod folder instead.
+
+Multiplayer
+-----------
+
+Only the host needs RV There Now for the expanded player cap. Every player
+who should hear synchronized internet radio must install the mod.
+
+Controls
+--------
+
+F6                 Open or close the dashboard
+F7                 Start or stop the selected internet station
+Up / Down          Select a row
+Left / Right       Change values or cycle stations
+Enter              Apply or open the selected item
+Escape             Close the current menu
+Page Up / Page Down  Change player-list pages
+
+Licenses
+--------
+
+RV There Now is GPL-3.0-or-later. UE4SS is distributed under the MIT License.
+Other bundled components retain the licenses included with the mod.

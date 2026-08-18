@@ -7,7 +7,7 @@ The game is designed for four players. Eight is the recommended expanded cap; la
 ## In-game menu
 
 - **F6** opens or closes the menu.
-- **F7** toggles the experimental internet-audio test while you are in the RV.
+- **F7** starts or stops the selected internet station while you are in the RV.
 - **Up/Down** selects a row and **Left/Right** changes its value.
 - **Enter** activates the selected row and **Escape** closes the menu.
 - Select **Radio Station** and press **Enter** to open the station list. Use **Up/Down** and **Enter** to choose, or **Escape** to cancel. **Left/Right** cycles stations directly.
@@ -43,10 +43,19 @@ Bundled third-party components are not relicensed. They remain available under t
 
 Install the package through Thunderstore Mod Manager or r2modman. The required `Thunderstore-unreal_shimloader` dependency is declared in `manifest.json` and should be installed automatically.
 
+Download the regular `Rogue-Factor-RVThereNow-<version>.zip` release asset when importing the mod locally. Do not use the standalone archive with a mod manager.
+
+## Standalone install with UE4SS included
+
+Download `Rogue-Factor-RVThereNow-<version>-Standalone.zip` from the GitHub release if you do not use a mod manager. Close the game, open its local files through Steam, and extract the archive into the top-level game folder that already contains `Ride`. The archive supplies the tested UE4SS build, Ride-specific settings, the mod, installation instructions, and license notices.
+
+Back up any existing UE4SS installation first. Users who already maintain UE4SS should install only the regular package's `mod` folder.
+
 For local development, build the Thunderstore package and import the resulting zip as a local mod:
 
 ```bash
 ./scripts/package.sh
+./scripts/package-standalone.sh
 ```
 
 ## Command-line fallback

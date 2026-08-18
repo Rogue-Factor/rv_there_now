@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.15.1
+
+- Add a standalone release archive containing the tested UE4SS build for one-drag manual installation.
+- Pin and verify the UE4SS source package and include its MIT license and attribution.
+- Configure the standalone UE4SS build specifically for Ride's Unreal Engine 5.6 runtime.
+- Keep the regular Thunderstore package dependent on `unreal_shimloader` to avoid mod-manager conflicts.
+
 ## 0.15.0
 
 - Replace the silent Steam Integration Kit procedural-wave handoff with continuous playback from the bundled native Windows bridge.
